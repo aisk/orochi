@@ -7,29 +7,10 @@
 //! the typed handles ([`List`](crate::List), [`Dict`](crate::Dict),
 //! [`Set`](crate::Set)) to keep a live reference instead.
 //!
-//! Conversions are strict: a `float` is not accepted where an integer is
-//! expected, `bool` is not accepted as a number, and a `str` is not accepted
-//! as a sequence. An `int` *is* accepted where a float is expected. Values
-//! that do not fit the Rust type raise `OverflowError`.
-//!
-//! | Rust | Python (into) | Python accepted (from) |
-//! |------|---------------|------------------------|
-//! | integers | `int` | `int` or any `__index__` object, not `bool` |
-//! | `f32`, `f64` | `float` | `float` or integer as above |
-//! | `bool` | `bool` | `bool` only |
-//! | `String`, `&str`, `Cow<str>`, `char` | `str` | `str` (`char`: length 1) |
-//! | `()` | `None` | `None` |
-//! | `Option<T>` | `T` or `None` | `T` or `None` |
-//! | `Vec<T>`, `&[T]`, `[T; N]` | `list` | any sequence except `str`, `bytes`, `bytearray`, `memoryview` |
-//! | `Vec<u8>`, `&[u8]`, `[u8; N]` | `bytes` | `bytes`, `bytearray`, or a sequence of ints |
-//! | `HashMap`, `BTreeMap` | `dict` | any `collections.abc.Mapping` |
-//! | `HashSet`, `BTreeSet` | `set` | `set` or `frozenset` |
-//! | tuples (1 to 12) | `tuple` | `tuple` of the same length |
-//! | `PathBuf`, `&Path` | `pathlib.Path` | `str` or `os.PathLike` |
-//! | `Box<T>` | as `T` | as `T` |
-//!
-//! `memoryview` (and other buffer objects) are rejected; buffer support is
-//! not part of orochi yet.
+//! Conversions are strict (no `float` for an integer, no `bool` for a
+//! number, no `str` for a sequence). The table of what converts to what is
+//! in `docs/reference.md` (section "Conversions"); keep it in sync with the
+//! implementations below.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

@@ -50,55 +50,33 @@
 //! # Ok::<(), orochi::Error>(())
 //! ```
 //!
-//! The attribute only reads names, signatures and doc comments; it
-//! generates plain calls to [`ModuleBuilder`] and [`ClassBuilder`], which
-//! can also be written by hand. See [`module`] for the rules and the
-//! generated code, and the README for building the extension.
+//! Rust types (`i64`, `String`, `Vec<T>`, ...) are converted copies, orochi's
+//! types ([`Object`], [`List`], [`Dict`], [`Set`], [`Ref`]) are the Python
+//! objects themselves, and the module's own classes are borrowed.
 //!
-//! ## Calling Python
+//! **The [reference] is the complete description**: every rule for
+//! parameters, return values and classes, the conversion table, what the
+//! macro generates, and what is not supported yet. The
+//! [README](https://github.com/aisk/orochi/blob/master/README.md) explains
+//! how to build an extension module.
 //!
-//! The same types work for calling Python from Rust, inside an extension or
-//! in a program embedding Python. Every handle ([`Object`], [`List`],
-//! [`Dict`], [`Set`], [`Ref`]) is `Clone + Send + Sync + 'static` and
-//! attaches to the interpreter on its own.
+//! Where to start in the API:
 //!
-//! ```
-//! use orochi::prelude::*;
+//! - [`module`]: the attribute macro.
+//! - [`Object`], [`List`], [`Dict`], [`Set`], [`Ref`]: references to Python
+//!   objects; [`IntoObject`] / [`FromObject`]: conversions of Rust values.
+//! - [`import`], [`eval`], [`exec`], [`Scope`], [`Object::call`],
+//!   [`kwargs!`], [`Object::from_fn`]: calling Python from Rust, inside an
+//!   extension or in a program that embeds Python (with the `embed`
+//!   feature).
+//! - [`Error`]: a Python exception.
+//! - [`ModuleBuilder`], [`ClassBuilder`]: writing a module by hand, without
+//!   the macro.
 //!
-//! let json = orochi::import("json")?;
-//! let data = json.method("loads", r#"{"a": [1, 2, 3]}"#)?;
-//! let a: Vec<i64> = data.item("a")?.to()?;
-//! assert_eq!(a, [1, 2, 3]);
+//! Features: `macros` (default) provides [`module`]; `embed` starts the
+//! interpreter on first use, for programs and tests that embed Python.
 //!
-//! let text = json.method_kw("dumps", &data, kwargs! { "sort_keys" => true })?;
-//! assert_eq!(text.to::<String>()?, r#"{"a": [1, 2, 3]}"#);
-//! # Ok::<(), orochi::Error>(())
-//! ```
-//!
-//! ## Conversions
-//!
-//! [`IntoObject`] and [`FromObject`] convert between Rust and Python. Owned
-//! Rust types (`i64`, `String`, `Vec<T>`, `HashMap<K, V>`, ...) are copies;
-//! [`Object`], the typed handles and [`Ref`] are live references.
-//! Conversions are strict: a `float` is not an integer, a `bool` is not a
-//! number and a `str` is not a list.
-//!
-//! ## Embedding
-//!
-//! Inside an extension module the interpreter is already running. To use
-//! orochi from a plain Rust program (or its tests), enable the `embed`
-//! feature, which starts the interpreter on first use. Without it, using
-//! orochi before an interpreter exists panics with a message saying so.
-//!
-//! ## Threads and locks
-//!
-//! Every operation attaches the calling thread to the interpreter (taking
-//! the GIL on non-free-threaded builds) for its duration. Do not hold a Rust
-//! lock (`Mutex`, `RwLock`, ...) while calling into Python if another thread
-//! may take that same lock while it is attached to Python: thread A holds the
-//! mutex and waits for the GIL, thread B holds the GIL (e.g. inside a
-//! function called from Python) and waits for the mutex, and both block
-//! forever. Release the lock first, or only take it while not calling Python.
+//! [reference]: https://github.com/aisk/orochi/blob/master/docs/reference.md
 
 mod args;
 mod builder;
@@ -164,129 +142,29 @@ pub mod __private {
 /// # Ok::<(), orochi::Error>(())
 /// ```
 ///
+/// Items with plain `pub` visibility are exported; private and `pub(crate)`
+/// items stay Rust-only. Doc comments become docstrings.
+///
+/// - `pub fn`: a function. Its parameter names are the Python names;
+///   trailing `Option` parameters default to `None`.
+/// - `pub struct`: a class. In its `impl` blocks, `pub fn new` is the
+///   constructor, the other `pub fn`s are methods (with `self`) or static
+///   methods, and `pub const`s are class attributes; `pub` fields are
+///   properties (see [`Field`]). `Debug`, `Display`, `PartialEq` and `Hash`
+///   give `__repr__`, `__str__`, `__eq__` and `__hash__`.
+/// - `pub const` / `pub static`: a module attribute.
+/// - inline `pub mod name { ... }`: the submodule `parent.name`.
+///
 /// The Python module name is the Rust module name;
-/// `#[orochi::module(name = "other")]` overrides it. All items stay ordinary
-/// Rust items, callable from Rust.
+/// `#[orochi::module(name = "other")]` sets another. The items stay
+/// ordinary Rust items. The macro generates plain [`ModuleBuilder`] calls,
+/// the extension's `PyInit_<name>` entry point, and `mylib::__orochi_module()`,
+/// which builds the module in-process for tests ([`load_module`]).
 ///
-/// # What is exported
+/// The [reference] has the full rules for parameters, return values and
+/// classes, the generated code, and the list of what is not supported yet.
 ///
-/// Items with plain `pub` visibility; private and `pub(crate)` items are
-/// not. Doc comments become `__doc__`.
-///
-/// - `pub fn` is a function. Its parameter names are the Python names, so
-///   arguments can be passed by keyword; trailing `Option` parameters
-///   default to `None`.
-/// - `pub struct` is a class. In its inherent `impl` blocks, `pub fn new`
-///   without `self` is the constructor (returning `Self` or
-///   `Result<Self, E>`), other `pub fn`s with `&self` / `&mut self` (or
-///   `self` for a `Clone` class) are methods, those without `self` are
-///   static methods, and `pub const`s are class attributes. `pub` fields are
-///   read/write properties (see [`Field`]). Derived or implemented `Debug`,
-///   `Display`, `PartialEq` and `Hash` give `__repr__`, `__str__`, `__eq__`
-///   and `__hash__` (with `PartialEq` but without `Hash`, the class is
-///   unhashable, as in Python). Classes must be `Send + Sync`.
-/// - `pub const` / `pub static` are module attributes (a copy of the value).
-/// - `pub mod name { ... }` is the submodule `parent.name` (also importable
-///   as `import parent.name`).
-///
-/// # The three rules
-///
-/// 1. **Rust types are values**: `i64`, `String`, `Vec<T>`, `HashMap<K, V>`,
-///    `PathBuf`, tuples, ... are converted with [`FromObject`] /
-///    [`IntoObject`]; nothing the function does to them is visible to the
-///    caller. `&str`, `&[T]`, `&Path`, `&HashMap<K, V>` and `Option<&str>`
-///    parameters borrow such a converted copy.
-/// 2. **orochi types are references**: [`Object`], [`List`], [`Dict`],
-///    [`Set`] and [`Ref`] refer to the caller's object itself, so a function
-///    taking `List<T>` can modify the caller's list.
-/// 3. **Classes of the module are borrowed**: `&self`, `&mut self`,
-///    `&Point`, `&mut Point` and `Option<&Point>` borrow the instance itself;
-///    a conflicting borrow (e.g. `p.absorb(p)` with `&mut self` and
-///    `&Point`) raises `RuntimeError`. A class by value (`p: Point`) is a
-///    copy and needs `Clone`.
-///
-/// `&mut` of anything but a class is a compile error: take `List<T>`,
-/// `Dict<K, V>` or `Set<T>` to modify the caller's container, and return
-/// new values otherwise. Conversions are strict (`add(True)` and
-/// `add(1.5)` raise `TypeError`, naming the argument).
-///
-/// # Return values
-///
-/// - any [`IntoObject`] type: a new Python object, or the object itself for
-///   a reference type ([`Object`], [`List`], [`Ref<T>`](Ref), ...);
-///   `Option` and `Result` of those, `()` (`None`), tuples and collections
-///   of those (`Vec<Ref<Point>>`);
-/// - a class by value (a new instance) as `T`, `Option<T>` or
-///   `Result<T, E>`.
-///
-/// `Result<_, E>` needs `E: Into<orochi::Error>` (`std::io::Error` maps to
-/// the matching `OSError` subclass) and raises on `Err`. Borrowed values
-/// cannot be returned: return `String`, not `&str`; a method that modifies
-/// `self` returns `()`. A panic raises `pyo3_runtime.PanicException`.
-///
-/// # What it generates
-///
-/// Each `pub struct` gets pyo3's `#[pyclass]` and, if it has `pub fn new`,
-/// a `#[pymethods]` block with a `#[new]` that calls [`construct`] (so the
-/// instance is created only by `new`). Every module gets an
-/// `__orochi_init` function of [`ModuleBuilder`] calls, the root module a
-/// `#[pymodule]` (the `PyInit_<name>` entry point) that runs it, and
-/// `__orochi_module()`, which builds the module in-process
-/// ([`load_module`]) for tests and embedding. For the example above:
-///
-/// ```ignore
-/// #[::orochi::pyo3::pymethods(crate = "::orochi::pyo3")]
-/// impl Point {
-///     #[new]
-///     #[pyo3(signature = (*args, **kwargs), text_signature = None)]
-///     fn __orochi_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-///         ::orochi::construct(args, kwargs)
-///     }
-/// }
-///
-/// pub fn __orochi_init(__orochi_m: &::orochi::ModuleBuilder<'_>) -> ::orochi::Result<()> {
-///     __orochi_m.doc("The module docstring.")?;
-///     let __orochi_c = __orochi_m.class::<Point>()?;
-///     __orochi_c.constructor(&["x", "y"], "", Point::new)?;
-///     __orochi_c.field("x", "", |s: &Point| &s.x, |s: &mut Point| &mut s.x)?;
-///     __orochi_c.field("y", "", |s: &Point| &s.y, |s: &mut Point| &mut s.y)?;
-///     __orochi_c.method("norm", &[], "", Point::norm)?;
-///     __orochi_c.repr_debug()?;
-///     __orochi_c.eq()?;
-///     __orochi_m.function("add", &["a", "b"], "Becomes `mylib.add`, with this docstring.", self::add)?;
-///     __orochi_m.submodule("geometry", "", self::geometry::__orochi_init)?;
-///     Ok(())
-/// }
-/// ```
-///
-/// (plus compile-time checks that report a parameter or return type
-/// without a conversion on that type). The doc comment of `new` is appended
-/// to the class doc. `Debug`, `Display`, `PartialEq` and `Hash` are
-/// recognized by name, in `#[derive(...)]` or `impl ... for` the class.
-///
-/// # Not supported (yet)
-///
-/// Compile errors on `pub` items (make the item private to keep it
-/// Rust-only): enums, generic parameters and explicit lifetimes (`'_` is
-/// fine), `async`, `unsafe` and `extern` functions, more than 12
-/// parameters, `impl Trait`, parameters that are patterns, returning
-/// borrowed values, special methods written by hand (`__len__`, ...), tuple
-/// structs with `pub` fields, `pub` fields that are not a [`Field`]
-/// (`Vec<T>`, maps, classes by value), `pub use`, `pub trait`, `pub type`,
-/// `pub static mut`, non-inline `pub mod`, `impl` blocks with `pub` items
-/// for a struct of another module, Python keywords as names (`r#in`), names
-/// starting with `__orochi`, `#[cfg]` on parameters or on the
-/// `Debug`/`Display`/`PartialEq`/`Hash` impls of a class.
-///
-/// Classes by value only work alone, in `Option` or in `Result` as return
-/// values, and alone as parameters: not `Vec<Point>`, `(Point, Point)` or
-/// `Result<Option<Point>, E>` returns, nor `Option<Point>` or `Vec<Point>`
-/// parameters; use `Ref<Point>` there.
-///
-/// Silently not seen: items produced by `macro_rules!` macros inside the
-/// module, and derives behind `#[cfg_attr(..., derive(...))]`. There are no
-/// `.pyi` stubs, no subclassing, no keyword-only or `*args` parameters, and
-/// no Rust-side defaults other than `None`.
+/// [reference]: https://github.com/aisk/orochi/blob/master/docs/reference.md
 #[cfg(feature = "macros")]
 pub use orochi_macros::module;
 
@@ -324,3 +202,8 @@ macro_rules! kwargs {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+/// Compiles and runs the examples of the reference as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/reference.md")]
+struct ReferenceDoctests;
