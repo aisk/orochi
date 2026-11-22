@@ -1,0 +1,17 @@
+[package]
+name = "orochi-macros"
+version = "0.1.0"
+edition = "2024"
+description = "The `#[orochi::module]` attribute macro (use it through the `orochi` crate)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.10", features = ["full"] }
+
+[lints.rust]
+# MSVC prints "Creating library ..." when linking a DLL; not a problem.
+linker_messages = "allow"

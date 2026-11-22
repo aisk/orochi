@@ -75,6 +75,12 @@ use crate::runtime::attach;
 /// assert_eq!(p.to_string(), "(1.0, 2.0)");
 /// # Ok::<(), orochi::Error>(())
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be converted into a Python object",
+    label = "does not implement `orochi::IntoObject`",
+    note = "a struct or enum defined in an `#[orochi::module]` is convertible when it is `pub` \
+            (and therefore a Python class); other types need an `IntoObject` implementation"
+)]
 pub trait IntoObject {
     /// Performs the conversion.
     fn into_object(self) -> Result<Object>;
@@ -130,6 +136,15 @@ pub trait IntoObject {
 /// assert_eq!(c.0, 21.5);
 /// # Ok::<(), orochi::Error>(())
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be converted from a Python object",
+    label = "does not implement `orochi::FromObject`",
+    note = "implement `orochi::FromObject` for `{Self}`, or take a type that already \
+            implements it (numbers, `String`, `Vec<T>`, maps, `Object`, ...)",
+    note = "if `{Self}` is a class of an `#[orochi::module]`: taking it by value means taking \
+            a copy, which needs `#[derive(Clone)]`; take `&{Self}`, `&mut {Self}` or \
+            `Ref<{Self}>` to use the caller's instance itself"
+)]
 pub trait FromObject: Sized {
     /// Whether a converted value may still refer to live Python objects.
     ///
@@ -168,6 +183,11 @@ pub(crate) fn type_mismatch(expected: &str, obj: &Bound<'_, PyAny>) -> Error {
         .map(|n| n.to_string())
         .unwrap_or_else(|_| "<unknown>".to_owned());
     Error::type_error(format!("expected {expected}, got {got}"))
+}
+
+/// [`type_mismatch`] for an [`Object`].
+pub(crate) fn type_mismatch_object(expected: &str, obj: &Object) -> Error {
+    attach(|py| type_mismatch(expected, obj.bind(py)))
 }
 
 /// Converts a borrowed pyo3 object with `T`'s `FromObject` implementation.
