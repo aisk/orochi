@@ -26,6 +26,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// `{:#}` prints the full Python rendering: traceback, notes and chained
 /// exceptions. `Debug` includes the traceback too.
 ///
+/// For hand-written pyo3 code, `Error` converts to and from pyo3's `PyErr`
+/// with `From` / `Into` (so `?` works both ways), and `as_ref()` borrows the
+/// `PyErr`.
+///
 /// ```
 /// let err = orochi::eval("1 / 0").unwrap_err();
 /// assert!(err.is_instance_of("ZeroDivisionError"));
@@ -44,41 +48,37 @@ impl Error {
     /// (`"ValueError"`, `"KeyError"`, ...) or a dotted path to an exception
     /// class in an importable module (the module is imported if needed).
     ///
+    /// Returns a `TypeError` instead if `exception_type` does not name an
+    /// exception class (a misspelled name, say), or if the class cannot be
+    /// constructed from a single message argument (for example
+    /// `UnicodeDecodeError`, which needs five; the construction error is the
+    /// `TypeError`'s cause). Use [`Error::from_value`] for exceptions that
+    /// need other arguments.
+    ///
     /// ```
     /// let err = orochi::Error::new("LookupError", "not here");
     /// assert_eq!(err.to_string(), "LookupError: not here");
     ///
     /// let err = orochi::Error::new("concurrent.futures.CancelledError", "stop");
     /// assert_eq!(err.type_name(), "CancelledError");
+    ///
+    /// let err = orochi::Error::new("LookupErorr", "typo");
+    /// assert_eq!(err.to_string(), "TypeError: 'LookupErorr' is not an exception type");
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if `exception_type` does not name an exception class, or if the
-    /// class cannot be constructed from a single message argument (for
-    /// example `UnicodeDecodeError`, which needs five). These are programming
-    /// errors, like a misspelled exception name in Python; use
-    /// [`Error::from_value`] for exceptions that need other arguments.
     pub fn new(exception_type: &str, message: impl Into<String>) -> Self {
         let message = message.into();
-        attach(|py| {
-            let ty = resolve_exception_type(py, exception_type, true)
-                .unwrap_or_else(|| {
-                    panic!("orochi::Error::new: `{exception_type}` is not an exception type")
-                });
-            instantiate(&ty, message, exception_type)
+        attach(|py| match resolve_exception_type(py, exception_type, true) {
+            Some(ty) => instantiate(&ty, message, exception_type),
+            None => Error::type_error(format!("'{exception_type}' is not an exception type")),
         })
     }
 
     /// Creates an exception from a Python exception class object (for
     /// example a custom exception class defined in Python).
     ///
-    /// Returns a `TypeError` if `exception_type` is not an exception class.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the class cannot be constructed from a single message
-    /// argument (see [`Error::new`]).
+    /// Returns a `TypeError` instead if `exception_type` is not an exception
+    /// class, or if it cannot be constructed from a single message argument
+    /// (see [`Error::new`]).
     pub fn from_type(exception_type: &Object, message: impl Into<String>) -> Self {
         let message = message.into();
         attach(|py| {
@@ -180,31 +180,12 @@ impl Error {
     /// `module.Class` path. A dotted path is looked up among the *already
     /// imported* modules only (nothing is imported as a side effect); if the
     /// module is not loaded, no exception can be an instance of its classes
-    /// and this returns `false`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a builtin name, or an attribute of a loaded module, is not
-    /// an exception class (typo protection, as in [`Error::new`]).
+    /// and this returns `false`. A name that does not resolve to an exception
+    /// class (a misspelled name, say) also returns `false`.
     pub fn is_instance_of(&self, exception_type: &str) -> bool {
-        attach(|py| {
-            let loaded = match exception_type.rsplit_once('.') {
-                Some((module, _)) => py
-                    .import("sys")
-                    .and_then(|sys| sys.getattr("modules"))
-                    .and_then(|m| m.contains(module))
-                    .unwrap_or(false),
-                None => true,
-            };
-            if !loaded {
-                return false;
-            }
-            match resolve_exception_type(py, exception_type, false) {
-                Some(ty) => self.0.is_instance(py, ty.as_any()),
-                None => panic!(
-                    "orochi::Error::is_instance_of: `{exception_type}` is not an exception type"
-                ),
-            }
+        attach(|py| match resolve_exception_type(py, exception_type, false) {
+            Some(ty) => self.0.is_instance(py, ty.as_any()),
+            None => false,
         })
     }
 
@@ -221,15 +202,8 @@ impl Error {
     }
 
     /// Unwraps the underlying pyo3 error.
-    #[doc(hidden)]
-    pub fn into_pyerr(self) -> PyErr {
+    pub(crate) fn into_pyerr(self) -> PyErr {
         self.0
-    }
-
-    /// Borrows the underlying pyo3 error.
-    #[doc(hidden)]
-    pub fn as_pyerr(&self) -> &PyErr {
-        &self.0
     }
 }
 
@@ -257,15 +231,20 @@ fn resolve_exception_type<'py>(
 }
 
 /// Instantiates `ty(message)` eagerly, so that a class that cannot be built
-/// from one argument is reported here and not replaced by a `TypeError` when
-/// the error is first used.
+/// from one argument is reported here (as a `TypeError` caused by the
+/// construction error) and not replaced by a `TypeError` when the error is
+/// first used.
 fn instantiate(ty: &Bound<'_, PyType>, message: String, name: &str) -> Error {
     match ty.call1((message,)) {
         Ok(value) => Error(PyErr::from_value(value)),
-        Err(err) => panic!(
-            "orochi::Error: exception type `{name}` cannot be constructed from a single message \
-             argument: {err}"
-        ),
+        Err(err) => {
+            let py = ty.py();
+            let error = PyTypeError::new_err(format!(
+                "exception type '{name}' cannot be constructed from a single message argument"
+            ));
+            error.set_cause(py, Some(err));
+            Error(error)
+        }
     }
 }
 
@@ -330,6 +309,12 @@ impl From<PyErr> for Error {
 impl From<Error> for PyErr {
     fn from(err: Error) -> Self {
         err.0
+    }
+}
+
+impl AsRef<PyErr> for Error {
+    fn as_ref(&self) -> &PyErr {
+        &self.0
     }
 }
 

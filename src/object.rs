@@ -41,6 +41,29 @@ use crate::runtime::{attach, try_attach};
 /// feature) or is shutting down. Objects kept in Rust `static`s or in
 /// threads that outlive the interpreter must not be used after Python has
 /// begun finalization; dropping them then is harmless.
+///
+/// # pyo3 interop
+///
+/// Hand-written pyo3 code (with the re-exported [`pyo3`](crate::pyo3))
+/// converts with `From` / `Into`: an `Object` from a `Py<PyAny>` or a
+/// `Bound<'py, PyAny>`, and a `Py<PyAny>` from an `Object`. `as_ref()`
+/// borrows the `Py<PyAny>`, and `.bind(py)` on it the `Bound`:
+///
+/// ```
+/// use orochi::Object;
+/// use orochi::pyo3::prelude::*;
+///
+/// let n = orochi::eval("41")?;
+/// let n: i64 = Python::attach(|py| {
+///     let n: &Py<PyAny> = n.as_ref();
+///     n.bind(py).add(1)?.extract::<i64>()
+/// })?;
+/// assert_eq!(n, 42);
+///
+/// let s = Python::attach(|py| py.eval(c"'a' * 3", None, None).map(Object::from))?;
+/// assert_eq!(s.to::<String>()?, "aaa");
+/// # Ok::<(), orochi::Error>(())
+/// ```
 pub struct Object(Py<PyAny>);
 
 impl Object {
@@ -321,35 +344,25 @@ impl Object {
         attach(|py| Ok(self.bind(py).str()?.to_string()))
     }
 
-    // ---- pyo3 interop (used by orochi's own layers) ----
+    // ---- pyo3 interop inside the crate (the public one is `From` / `AsRef`) ----
 
     /// Wraps a pyo3 bound reference.
-    #[doc(hidden)]
-    pub fn from_bound(obj: Bound<'_, PyAny>) -> Object {
+    pub(crate) fn from_bound(obj: Bound<'_, PyAny>) -> Object {
         Object(obj.unbind())
     }
 
     /// Wraps a pyo3 owned reference.
-    #[doc(hidden)]
-    pub fn from_py(obj: Py<PyAny>) -> Object {
+    pub(crate) fn from_py(obj: Py<PyAny>) -> Object {
         Object(obj)
     }
 
     /// Borrows the object as a pyo3 bound reference.
-    #[doc(hidden)]
-    pub fn bind<'py>(&self, py: Python<'py>) -> &Bound<'py, PyAny> {
+    pub(crate) fn bind<'py>(&self, py: Python<'py>) -> &Bound<'py, PyAny> {
         self.0.bind(py)
     }
 
-    /// Borrows the underlying pyo3 reference.
-    #[doc(hidden)]
-    pub fn as_py(&self) -> &Py<PyAny> {
-        &self.0
-    }
-
     /// Unwraps the underlying pyo3 reference.
-    #[doc(hidden)]
-    pub fn into_py(self) -> Py<PyAny> {
+    pub(crate) fn into_py(self) -> Py<PyAny> {
         self.0
     }
 
@@ -400,6 +413,12 @@ impl<'py> From<Bound<'py, PyAny>> for Object {
 impl From<Object> for Py<PyAny> {
     fn from(obj: Object) -> Self {
         obj.0
+    }
+}
+
+impl AsRef<Py<PyAny>> for Object {
+    fn as_ref(&self) -> &Py<PyAny> {
+        &self.0
     }
 }
 

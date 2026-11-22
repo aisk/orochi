@@ -76,12 +76,13 @@ fn init(m: &ModuleBuilder<'_>) -> Result<()> {
         |a: &mut Account, owner: String| a.owner = owner,
     )?;
     c.repr_debug()?.str_display()?.eq()?.hash()?;
-    // Chaining from the temporary, and binding the result.
-    let v = m.class::<Vault>()?.static_method("hint", &[], "", || 42)?;
-    v.constructor(&["code"], "", |code: i64| -> Result<Vault> {
-        if code == 42 { Ok(Vault) } else { Err(orochi::Error::value_error("wrong code")) }
-    })?;
-    v.constant("NAME", "vault")?;
+    // Chaining from the temporary.
+    m.class::<Vault>()?
+        .static_method("hint", &[], "", || 42)?
+        .constructor(&["code"], "", |code: i64| -> Result<Vault> {
+            if code == 42 { Ok(Vault) } else { Err(orochi::Error::value_error("wrong code")) }
+        })?
+        .constant("NAME", "vault")?;
     m.submodule("util", "Helpers.", |sub| {
         sub.function("double", &["x"], "", |x: f64| x * 2.0)?;
         Ok(())
@@ -215,4 +216,44 @@ fn parameter_name_count_must_match() {
     })
     .unwrap_err();
     assert!(err.message().contains("Probe: 2 parameter names given for a Rust function with 1 parameters"), "{err}");
+}
+
+/// Two classes with the same data, to call `eq()` and `hash()` in both orders.
+macro_rules! key_class {
+    ($name:ident) => {
+        #[pyclass(crate = "orochi::pyo3")]
+        #[derive(PartialEq, Eq, Hash)]
+        struct $name(i64);
+
+        #[pymethods(crate = "orochi::pyo3")]
+        impl $name {
+            #[new]
+            #[pyo3(signature = (*args, **kwargs), text_signature = None)]
+            fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                orochi::construct(args, kwargs)
+            }
+        }
+    };
+}
+
+key_class!(EqFirst);
+key_class!(HashFirst);
+
+#[test]
+fn eq_and_hash_in_either_order() {
+    orochi::load_module("keys", |m| {
+        m.class::<EqFirst>()?.constructor(&["k"], "", EqFirst)?.eq()?.hash()?;
+        m.class::<HashFirst>()?.constructor(&["k"], "", HashFirst)?.hash()?.eq()?;
+        Ok(())
+    })
+    .unwrap();
+    crate::run(
+        r#"
+        import keys
+        for K in (keys.EqFirst, keys.HashFirst):
+            assert K(1) == K(1) and K(1) != K(2), K
+            assert hash(K(1)) == hash(K(1)), K
+            assert len({K(1), K(1), K(2)}) == 2, K
+    "#,
+    );
 }

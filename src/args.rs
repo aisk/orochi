@@ -3,7 +3,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
+use crate::class::{Class, Ref};
 use crate::convert::IntoObject;
 use crate::error::{Error, Result};
 use crate::handles::{Dict, List, Set};
@@ -15,8 +17,8 @@ use crate::object::Object;
 /// - A tuple `(a, b, ...)` (up to 12 elements) is an argument list; one
 ///   argument in tuple form needs a trailing comma: `(x,)`.
 /// - A single plain value is one argument: numbers, `bool`, `char`, strings,
-///   `Object` / `&Object`, the handles (`List`, `Dict`, `Set`, and references
-///   to them) and `Option<T>` of those.
+///   paths (`PathBuf`, `&Path`), `Object` / `&Object`, the handles (`List`,
+///   `Dict`, `Set`, `Ref`, and references to them) and `Option<T>` of those.
 /// - Collections (`Vec`, `HashMap`, slices, ...) are *not* accepted bare, to
 ///   avoid ambiguity; write `(vec,)`.
 /// - [`Args`] holds an argument list whose length is only known at runtime.
@@ -79,7 +81,7 @@ macro_rules! single_arg_impls {
 
 single_arg_impls!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char,
-    &str, String, &String, Cow<'_, str>, Object, &Object,
+    &str, String, &String, Cow<'_, str>, PathBuf, &PathBuf, &Path, Object, &Object,
 );
 
 impl<T: IntoObject> IntoArgs for Option<T> {
@@ -104,6 +106,18 @@ macro_rules! handle_arg_impls {
 }
 
 handle_arg_impls!(List<T>, Dict<K, V>, Set<T>);
+
+impl<T: Class> IntoArgs for Ref<T> {
+    fn into_args(self) -> Result<Vec<Object>> {
+        Ok(vec![self.into_object()?])
+    }
+}
+
+impl<T: Class> IntoArgs for &Ref<T> {
+    fn into_args(self) -> Result<Vec<Object>> {
+        Ok(vec![self.into_object()?])
+    }
+}
 
 /// A positional argument list built at runtime.
 ///

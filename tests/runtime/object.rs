@@ -94,6 +94,10 @@ fn single_argument_calls() -> Result<()> {
     assert_eq!(one(ident.call(std::borrow::Cow::Borrowed("w"))?)?.to::<String>()?, "w");
     assert!(one(ident.call(None::<i64>)?)?.is_none());
     assert_eq!(one(ident.call(Some(3))?)?.to::<i64>()?, 3);
+    let path = std::path::PathBuf::from("a/b");
+    assert_eq!(one(ident.call(path.as_path())?)?.to::<std::path::PathBuf>()?, path);
+    assert_eq!(one(ident.call(&path)?)?.to::<std::path::PathBuf>()?, path);
+    assert_eq!(one(ident.call(path.clone())?)?.to::<std::path::PathBuf>()?, path);
 
     let obj = eval("[1]")?;
     assert!(one(ident.call(&obj)?)?.is(&obj));

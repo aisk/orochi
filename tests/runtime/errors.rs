@@ -88,24 +88,36 @@ fn rust_created_errors() {
 }
 
 #[test]
-#[should_panic(expected = "not an exception type")]
-fn unknown_exception_name_panics() {
-    let _ = Error::new("DefinitelyNotAnException", "x");
+fn unknown_exception_name_is_type_error() {
+    let err = Error::new("DefinitelyNotAnException", "x");
+    assert_eq!(err.to_string(), "TypeError: 'DefinitelyNotAnException' is not an exception type");
+    // Not a class, a class that is not an exception, a missing module.
+    for name in ["len", "int", "no_such_module_xyz.Error"] {
+        let err = Error::new(name, "x");
+        assert_eq!(err.message(), format!("'{name}' is not an exception type"));
+    }
 }
 
 #[test]
-#[should_panic(expected = "cannot be constructed from a single message argument")]
-fn exception_needing_more_arguments_panics() {
+fn exception_needing_more_arguments_is_type_error() -> Result<()> {
     // JSONDecodeError(msg, doc, pos) needs three arguments; it used to turn
-    // silently into a TypeError.
-    let _ = Error::new("json.JSONDecodeError", "boom");
-}
+    // silently into a TypeError about the missing arguments.
+    let err = Error::new("json.JSONDecodeError", "boom");
+    assert_eq!(
+        err.to_string(),
+        "TypeError: exception type 'json.JSONDecodeError' cannot be constructed from a single message argument"
+    );
+    // The construction error is the cause.
+    let cause = err.value().attr("__cause__")?;
+    assert_eq!(cause.type_name(), "TypeError");
+    assert!(cause.str()?.contains("missing"), "{cause}");
 
-#[test]
-#[should_panic(expected = "cannot be constructed from a single message argument")]
-fn from_type_needing_more_arguments_panics() {
-    let cls = orochi::builtins().attr("UnicodeDecodeError").unwrap();
-    let _ = Error::from_type(&cls, "boom");
+    let cls = orochi::builtins().attr("UnicodeDecodeError")?;
+    let err = Error::from_type(&cls, "boom");
+    assert!(err.is_instance_of("TypeError"));
+    assert!(err.message().contains("'UnicodeDecodeError' cannot be constructed"), "{err}");
+    assert_eq!(err.value().attr("__cause__")?.type_name(), "TypeError");
+    Ok(())
 }
 
 #[test]
@@ -121,15 +133,12 @@ fn from_value_for_complex_exceptions() -> Result<()> {
 }
 
 #[test]
-#[should_panic(expected = "not an exception type")]
-fn is_instance_of_unknown_builtin_panics() {
-    let _ = Error::value_error("x").is_instance_of("ValueErorr");
-}
-
-#[test]
-#[should_panic(expected = "not an exception type")]
-fn is_instance_of_non_exception_panics() {
-    let _ = Error::value_error("x").is_instance_of("len");
+fn is_instance_of_non_exception_is_false() {
+    let err = Error::value_error("x");
+    // Misspelled, not a class, a class that is not an exception.
+    for name in ["ValueErorr", "len", "int", "builtins.int"] {
+        assert!(!err.is_instance_of(name), "{name}");
+    }
 }
 
 #[test]
@@ -140,10 +149,10 @@ fn is_instance_of_does_not_import() -> Result<()> {
     assert!(!Error::value_error("x").is_instance_of("xml.dom.minidom.NoSuchError"));
     assert!(!modules.contains("xml.dom.minidom")?, "is_instance_of imported a module");
 
-    // Loaded module, unknown attribute: typo protection.
+    // Loaded module, unknown attribute or not an exception class.
     orochi::import("json")?;
-    let typo = std::panic::catch_unwind(|| Error::value_error("x").is_instance_of("json.JSONDecodeErorr"));
-    assert!(typo.is_err());
+    assert!(!Error::value_error("x").is_instance_of("json.JSONDecodeErorr"));
+    assert!(!Error::value_error("x").is_instance_of("json.JSONDecoder"));
     Ok(())
 }
 

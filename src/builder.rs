@@ -274,24 +274,13 @@ where
 
 /// Builds a class: attaches methods, properties and special methods to a
 /// `#[pyclass]` type. Created by [`ModuleBuilder::class`]; see there for an
-/// example. Every method returns the builder again (a cheap clone), so
-/// calls can be chained.
+/// example. Like [`ModuleBuilder`]'s, every method returns a reference to
+/// the builder, so calls can be chained.
 pub struct ClassBuilder<'py, T> {
     ty: Bound<'py, PyType>,
     module: String,
     qualname: String,
     _class: PhantomData<fn() -> T>,
-}
-
-impl<T> Clone for ClassBuilder<'_, T> {
-    fn clone(&self) -> Self {
-        ClassBuilder {
-            ty: self.ty.clone(),
-            module: self.module.clone(),
-            qualname: self.qualname.clone(),
-            _class: PhantomData,
-        }
-    }
 }
 
 impl<'py, T: Class> ClassBuilder<'py, T> {
@@ -322,11 +311,11 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
 
     /// Sets the class docstring (`__doc__`); an empty doc is ignored.
     /// (`#[pyclass]` already uses the struct's doc comment.)
-    pub fn doc(&self, doc: &str) -> Result<Self> {
+    pub fn doc(&self, doc: &str) -> Result<&Self> {
         if let Some(doc) = non_empty(doc) {
             self.ty.setattr("__doc__", doc)?;
         }
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// Sets the constructor, which the class's `#[new]` runs through
@@ -334,7 +323,7 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
     /// function), which returns `T` or `Result<T, E>`. Sets the class's
     /// `__signature__` and, the first time, appends `doc` to its docstring
     /// after a blank line.
-    pub fn constructor<M, F>(&self, params: &[&str], doc: &str, new: F) -> Result<Self>
+    pub fn constructor<M, F>(&self, params: &[&str], doc: &str, new: F) -> Result<&Self>
     where
         F: Handler<M>,
         F::Output: IntoInstance<T>,
@@ -353,24 +342,24 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
             };
             self.ty.setattr("__doc__", doc)?;
         }
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// Adds method `name`: the first parameter of `f` is `&T` or `&mut T`
     /// (or `T` for a `Clone` class), otherwise this fails; `params` names
     /// the others.
-    pub fn method<M, R, F>(&self, name: &str, params: &[&str], doc: &str, f: F) -> Result<Self>
+    pub fn method<M, R, F>(&self, name: &str, params: &[&str], doc: &str, f: F) -> Result<&Self>
     where
         F: Handler<M>,
         F::Output: Ret<R>,
     {
         let function = self.function(name, doc, true, params, f)?;
         self.ty.setattr(name, function)?;
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// Adds static method `name` (`f` has no `self`).
-    pub fn static_method<M, R, F>(&self, name: &str, params: &[&str], doc: &str, f: F) -> Result<Self>
+    pub fn static_method<M, R, F>(&self, name: &str, params: &[&str], doc: &str, f: F) -> Result<&Self>
     where
         F: Handler<M>,
         F::Output: Ret<R>,
@@ -378,18 +367,18 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
         let function = self.function(name, doc, false, params, f)?;
         let static_method = self.py().import("builtins")?.getattr("staticmethod")?.call1((function,))?;
         self.ty.setattr(name, static_method)?;
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// Adds class attribute `name` (a constant).
-    pub fn constant<M>(&self, name: &str, value: impl Ret<M>) -> Result<Self> {
+    pub fn constant<M>(&self, name: &str, value: impl Ret<M>) -> Result<&Self> {
         self.ty.setattr(name, value.ret(self.py())?)?;
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// Adds the read/write property `name`. `set` may return a value (such
     /// as the one it replaced); it is dropped after the instance is released.
-    pub fn property<G, R, S, V, D>(&self, name: &str, doc: &str, get: G, set: S) -> Result<Self>
+    pub fn property<G, R, S, V, D>(&self, name: &str, doc: &str, get: G, set: S) -> Result<&Self>
     where
         G: Fn(&T) -> R + Send + Sync + 'static,
         R: IntoObject,
@@ -411,7 +400,7 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
     }
 
     /// Adds the read-only property `name`.
-    pub fn readonly<G, R>(&self, name: &str, doc: &str, get: G) -> Result<Self>
+    pub fn readonly<G, R>(&self, name: &str, doc: &str, get: G) -> Result<&Self>
     where
         G: Fn(&T) -> R + Send + Sync + 'static,
         R: IntoObject,
@@ -429,7 +418,7 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
         doc: &str,
         get: impl Fn(&T) -> &V + Send + Sync + 'static,
         get_mut: impl Fn(&mut T) -> &mut V + Send + Sync + 'static,
-    ) -> Result<Self> {
+    ) -> Result<&Self> {
         self.property(name, doc, move |slf| get(slf).clone(), move |slf, value| std::mem::replace(get_mut(slf), value))
     }
 
@@ -442,15 +431,15 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
         self.function(name, "", true, &[], move |slf: &T| get(slf))
     }
 
-    fn add_property(&self, name: &str, doc: &str, fget: Bound<'py, PyAny>, fset: Option<Bound<'py, PyAny>>) -> Result<Self> {
+    fn add_property(&self, name: &str, doc: &str, fget: Bound<'py, PyAny>, fset: Option<Bound<'py, PyAny>>) -> Result<&Self> {
         let property = self.py().import("builtins")?.getattr("property")?;
         let property = property.call1((fget, fset, None::<()>, non_empty(doc)))?;
         self.ty.setattr(name, property)?;
-        Ok(self.clone())
+        Ok(self)
     }
 
     /// `__repr__` from `Debug`.
-    pub fn repr_debug(&self) -> Result<Self>
+    pub fn repr_debug(&self) -> Result<&Self>
     where
         T: std::fmt::Debug,
     {
@@ -458,7 +447,7 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
     }
 
     /// `__str__` from `Display`.
-    pub fn str_display(&self) -> Result<Self>
+    pub fn str_display(&self) -> Result<&Self>
     where
         T: std::fmt::Display,
     {
@@ -467,9 +456,9 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
 
     /// `__eq__` (and `!=`) from `PartialEq`; comparing with another type is
     /// `NotImplemented`. Like defining `__eq__` in Python, this makes the
-    /// class unhashable (`__hash__ = None`): call [`hash`](Self::hash)
-    /// afterwards to make it hashable again.
-    pub fn eq(&self) -> Result<Self>
+    /// class unhashable (`__hash__ = None`) unless it has its own `__hash__`
+    /// (from [`hash`](Self::hash), called before or after this one).
+    pub fn eq(&self) -> Result<&Self>
     where
         T: PartialEq,
     {
@@ -479,12 +468,17 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
                 Err(_) => Ok(Object::from_py(py.NotImplemented())),
             })
         })?;
-        self.ty.setattr("__hash__", self.py().None())?;
-        Ok(self.clone())
+        // Only the class's own `__dict__`: an inherited `__hash__` does not
+        // count, as in Python.
+        if !self.ty.getattr("__dict__")?.contains("__hash__")? {
+            self.ty.setattr("__hash__", self.py().None())?;
+        }
+        Ok(self)
     }
 
-    /// `__hash__` from `Hash`.
-    pub fn hash(&self) -> Result<Self>
+    /// `__hash__` from `Hash`; with [`eq`](Self::eq), in either order, the
+    /// class is hashable.
+    pub fn hash(&self) -> Result<&Self>
     where
         T: Hash,
     {

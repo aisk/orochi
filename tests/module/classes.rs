@@ -1,7 +1,7 @@
 //! Classes: construction, methods, special methods, borrowing and `Ref<T>`
 //! identity.
 
-use orochi::Ref;
+use orochi::{Object, Ref};
 
 use crate::{mylib, run, scope};
 
@@ -236,4 +236,18 @@ fn ref_from_rust() {
     assert!(back.is(&p));
     assert_eq!(*back.borrow().unwrap(), mylib::Point::new(1.0, 7.0));
     assert!(s.get("c").unwrap().to::<Ref<mylib::Point>>().is_err());
+}
+
+#[test]
+fn ref_as_single_argument() {
+    // Like the other handles, a `Ref` is passed bare, not as `(p,)`.
+    let s = scope();
+    let p = Ref::new(mylib::Point::new(3.0, 4.0)).unwrap();
+    let ident = orochi::eval("lambda *a: a").unwrap();
+    let args: Vec<Object> = ident.call(&p).unwrap().to().unwrap();
+    assert!(args.len() == 1 && args[0].is(&p.to_object()));
+    let args: Vec<Object> = ident.call(p.clone()).unwrap().to().unwrap();
+    assert!(args.len() == 1 && args[0].is(&p.to_object()));
+    let norm = s.eval("lambda p: p.norm()").unwrap();
+    assert_eq!(norm.call(&p).unwrap().to::<f64>().unwrap(), 5.0);
 }
