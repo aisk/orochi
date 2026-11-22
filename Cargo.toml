@@ -3,6 +3,7 @@ name = "orochi"
 version = "0.1.0"
 edition = "2024"
 description = "An ease-of-use-first layer over pyo3 for writing Python extensions in Rust"
+license = "BSD-3-Clause"
 
 [workspace]
 members = ["orochi-macros", "examples/demo"]

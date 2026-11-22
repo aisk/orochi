@@ -1,4 +1,4 @@
-"""Exercises the demo extension module; run by run.ps1."""
+"""Exercises the demo extension module; run by run.py."""
 
 import inspect
 import math

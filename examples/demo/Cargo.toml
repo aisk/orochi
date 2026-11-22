@@ -3,11 +3,12 @@ name = "demo"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "A small extension module built with orochi, imported by real Python in run.ps1"
+description = "A small extension module built with orochi, imported by real Python in run.py"
+license = "BSD-3-Clause"
 
 [lib]
 crate-type = ["cdylib"]
-# Only built as an extension module; `run.ps1` exercises it from Python.
+# Only built as an extension module; `run.py` exercises it from Python.
 test = false
 doctest = false
 

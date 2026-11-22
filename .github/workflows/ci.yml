@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The test binaries embed Python: make its shared library findable.
+      - name: Expose libpython (Linux)
+        if: runner.os == 'Linux'
+        run: echo "LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" >> "$GITHUB_ENV"
+      - name: Expose python3XX.dll (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python -c "import sys; print(sys.base_prefix)" >> $env:GITHUB_PATH
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: python examples/demo/run.py

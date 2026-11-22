@@ -1,5 +1,5 @@
 # Only for building a wheel with maturin (`maturin build`);
-# run.ps1 does not need it.
+# run.py does not need it.
 [build-system]
 requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"

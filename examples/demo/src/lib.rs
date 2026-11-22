@@ -1,6 +1,6 @@
-//! A small extension module built with orochi. `run.ps1` builds it, copies
-//! the DLL to `target/pyd/demo.pyd` and runs `check.py` against it with a
-//! real Python interpreter.
+//! A small extension module built with orochi. `run.py` builds it, copies
+//! the library to `target/pyd/` (`demo.pyd` or `demo.so`) and runs
+//! `check.py` against it with a real Python interpreter.
 
 #[orochi::module]
 mod demo {

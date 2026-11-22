@@ -223,8 +223,8 @@ Build it with [maturin](https://www.maturin.rs) (`maturin develop`), or by
 hand: `cargo build`, then copy the library to a directory on Python's path as
 `mylib.pyd` (Windows) or `mylib.so` (Linux/macOS; set
 `PYO3_BUILD_EXTENSION_MODULE=1` when building, as maturin does). The file name
-must match the module name. `examples/demo` is a complete example; on Windows
-`examples\demo\run.ps1` builds it and imports it with Python.
+must match the module name. `examples/demo` is a complete example:
+`python examples/demo/run.py` builds it this way and imports it with Python.
 
 ## Embedding Python
 
@@ -283,13 +283,25 @@ other holds the GIL and waits for the lock, and both hang.
 
 ## Development
 
-```powershell
-# The test binaries embed Python, so python3XX.dll must be on PATH (Windows).
-$env:PATH = "<python install dir>;$env:PATH"
+```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets
-.\examples\demo\run.ps1   # builds the demo extension and imports it with Python
-                          # (`py -3` or `python`; or pass -Python <python.exe>)
+python examples/demo/run.py   # builds the demo extension and imports it with Python
 ```
 
-`PYO3_PYTHON` can be set to select the interpreter used at build time.
+The test binaries embed Python, so the Python shared library must be findable
+at run time:
+
+- Windows: put the directory containing `python3XX.dll` on `PATH`. The
+  Microsoft Store `python.exe` (under `WindowsApps`) is only a shim; find the
+  real directory with `python -c "import sys; print(sys.base_prefix)"`.
+- Linux: add `python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"`
+  to `LD_LIBRARY_PATH` if `libpython3.X.so` is not in a system directory.
+- macOS: likewise with `DYLD_LIBRARY_PATH`, if needed.
+
+`PYO3_PYTHON` can be set to select the interpreter used at build time;
+`run.py` sets it to the Python that runs it.
+
+## License
+
+BSD 3-Clause; see [LICENSE](LICENSE).
