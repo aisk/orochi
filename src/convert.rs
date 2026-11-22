@@ -113,6 +113,101 @@ pub trait IntoObject {
     {
         format!("list[{}]", Self::output_hint())
     }
+
+    /// Which positions of a value of this type are read as live views when
+    /// it is a class field (see [`ViewShape`]).
+    #[doc(hidden)]
+    fn __shape() -> ViewShape
+    where
+        Self: Sized,
+    {
+        ViewShape::Plain
+    }
+
+    /// [`__shape`](IntoObject::__shape) of `Vec<Self>`. Overridden by `u8`
+    /// (`bytes` are not viewed).
+    #[doc(hidden)]
+    fn __vec_shape() -> ViewShape
+    where
+        Self: Sized,
+    {
+        ViewShape::List(Box::new(Self::__shape()))
+    }
+
+    /// Hint for a value read where [`__shape`](IntoObject::__shape) says:
+    /// containers are views themselves (`list` -> `ListView`), anything
+    /// else is what [`output_hint`](IntoObject::output_hint) says. The view
+    /// classes are spelled `_orochi.ListView` etc.; the stub renderer
+    /// defines them.
+    #[doc(hidden)]
+    fn __view_hint() -> String
+    where
+        Self: Sized,
+    {
+        Self::output_hint()
+    }
+
+    /// [`__view_hint`](IntoObject::__view_hint) of `Vec<Self>`. Overridden
+    /// by `u8` (`bytes` are not viewed).
+    #[doc(hidden)]
+    fn __vec_view_hint() -> String
+    where
+        Self: Sized,
+    {
+        format!(
+            "_orochi.ListView[{}, {}, {}]",
+            Self::__view_hint(),
+            Self::__input_hint(),
+            Self::output_hint()
+        )
+    }
+
+    /// What a view accepts as a new element of this type: the
+    /// [`FromObject::input_hint`] of the type, for the types that implement
+    /// both traits (only output hints are reachable from here, so this
+    /// defaults to the output hint, which is narrower but correct).
+    #[doc(hidden)]
+    fn __input_hint() -> String
+    where
+        Self: Sized,
+    {
+        Self::output_hint()
+    }
+
+    /// [`__input_hint`](IntoObject::__input_hint) of `Vec<Self>`.
+    #[doc(hidden)]
+    fn __vec_input_hint_into() -> String
+    where
+        Self: Sized,
+    {
+        format!("collections.abc.Sequence[{}]", Self::__input_hint())
+    }
+}
+
+/// The positions of a class field that are read as live views: a `Vec` is a
+/// `ListView` (of elements of the inner shape), a map a `DictView` (values
+/// of the inner shape), a set a `SetView`; a fixed-size array is a plain
+/// `list` whose elements have the inner shape; `Option` and `Box` are
+/// transparent; anything else (numbers, strings, tuples, `bytes`, `Object`,
+/// handles, `Ref`, custom types) is returned as it is.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewShape {
+    Plain,
+    List(Box<ViewShape>),
+    Dict(Box<ViewShape>),
+    Set,
+    Array(Box<ViewShape>),
+}
+
+impl ViewShape {
+    /// An array of elements of shape `inner` (plain if the elements are).
+    pub(crate) fn array(inner: ViewShape) -> ViewShape {
+        match inner {
+            ViewShape::Plain => ViewShape::Plain,
+            inner => ViewShape::Array(Box::new(inner)),
+        }
+    }
 }
 
 /// Conversion of a Python object into a Rust value.
@@ -173,6 +268,12 @@ pub trait FromObject: Sized {
     fn __vec_input_hint() -> String {
         format!("collections.abc.Sequence[{}]", Self::input_hint())
     }
+
+    /// For the handle types (`List`, `Dict`, `Set`): the builtin they refer
+    /// to. A live view of a field is not that builtin, so passing one is an
+    /// error instead of a silently detached copy.
+    #[doc(hidden)]
+    const __HANDLE_OF: Option<&'static str> = None;
 }
 
 /// Builds the standard "wrong type" error.
@@ -339,11 +440,21 @@ impl<T: IntoObject> IntoObject for Box<T> {
     fn output_hint() -> String {
         T::output_hint()
     }
+    fn __shape() -> ViewShape {
+        T::__shape()
+    }
+    fn __view_hint() -> String {
+        T::__view_hint()
+    }
+    fn __input_hint() -> String {
+        T::__input_hint()
+    }
 }
 
 /// Converts like `T`.
 impl<T: FromObject> FromObject for Box<T> {
     const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
+    const __HANDLE_OF: Option<&'static str> = T::__HANDLE_OF;
     fn from_object(obj: &Object) -> Result<Self> {
         T::from_object(obj).map(Box::new)
     }
@@ -394,6 +505,15 @@ impl IntoObject for u8 {
     }
     fn __vec_output_hint() -> String {
         "bytes".to_owned()
+    }
+    fn __vec_shape() -> ViewShape {
+        ViewShape::Plain
+    }
+    fn __vec_view_hint() -> String {
+        "bytes".to_owned()
+    }
+    fn __vec_input_hint_into() -> String {
+        "bytes | bytearray | collections.abc.Sequence[int]".to_owned()
     }
 }
 
@@ -599,6 +719,9 @@ impl IntoObject for PathBuf {
     fn output_hint() -> String {
         "pathlib.Path".to_owned()
     }
+    fn __input_hint() -> String {
+        "str | os.PathLike[str]".to_owned()
+    }
 }
 
 /// Becomes a `pathlib.Path`.
@@ -677,10 +800,20 @@ impl<T: IntoObject> IntoObject for Option<T> {
     fn output_hint() -> String {
         optional_hint(T::output_hint())
     }
+    fn __shape() -> ViewShape {
+        T::__shape()
+    }
+    fn __view_hint() -> String {
+        optional_hint(T::__view_hint())
+    }
+    fn __input_hint() -> String {
+        optional_hint(T::__input_hint())
+    }
 }
 
 impl<T: FromObject> FromObject for Option<T> {
     const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
+    const __HANDLE_OF: Option<&'static str> = T::__HANDLE_OF;
     fn from_object(obj: &Object) -> Result<Self> {
         if obj.is_none() { Ok(None) } else { T::from_object(obj).map(Some) }
     }
@@ -698,6 +831,15 @@ impl<T: IntoObject> IntoObject for Vec<T> {
     }
     fn output_hint() -> String {
         T::__vec_output_hint()
+    }
+    fn __shape() -> ViewShape {
+        T::__vec_shape()
+    }
+    fn __view_hint() -> String {
+        T::__vec_view_hint()
+    }
+    fn __input_hint() -> String {
+        T::__vec_input_hint_into()
     }
 }
 
@@ -728,6 +870,20 @@ impl<T: IntoObject, const N: usize> IntoObject for [T; N] {
     }
     fn output_hint() -> String {
         T::__vec_output_hint()
+    }
+    /// Arrays are copies (a plain `list`), but container elements of them
+    /// are live views.
+    fn __shape() -> ViewShape {
+        ViewShape::array(T::__shape())
+    }
+    fn __view_hint() -> String {
+        match T::__shape() {
+            ViewShape::Plain => T::__vec_output_hint(),
+            _ => format!("list[{}]", T::__view_hint()),
+        }
+    }
+    fn __input_hint() -> String {
+        T::__vec_input_hint_into()
     }
 }
 
@@ -823,6 +979,36 @@ impl<K: IntoObject, V: IntoObject, S> IntoObject for HashMap<K, V, S> {
     fn output_hint() -> String {
         format!("dict[{}, {}]", K::output_hint(), V::output_hint())
     }
+    fn __shape() -> ViewShape {
+        ViewShape::Dict(Box::new(V::__shape()))
+    }
+    fn __view_hint() -> String {
+        mapping_view_hint::<K, V>()
+    }
+    fn __input_hint() -> String {
+        format!("dict[{}, {}]", K::__input_hint(), V::__input_hint())
+    }
+}
+
+/// View hint of a map: keys are copies, values may be views themselves.
+fn mapping_view_hint<K: IntoObject, V: IntoObject>() -> String {
+    format!(
+        "_orochi.DictView[{}, {}, {}, {}]",
+        K::output_hint(),
+        V::__view_hint(),
+        V::__input_hint(),
+        V::output_hint()
+    )
+}
+
+/// View hint of a set (elements are hashable, never views).
+fn set_view_hint<T: IntoObject>() -> String {
+    format!("_orochi.SetView[{}]", T::output_hint())
+}
+
+fn set_input_hint<T: IntoObject>() -> String {
+    let t = T::__input_hint();
+    format!("set[{t}] | frozenset[{t}]")
 }
 
 /// Accepts a `dict` (or subclass).
@@ -853,6 +1039,15 @@ impl<K: IntoObject, V: IntoObject> IntoObject for BTreeMap<K, V> {
     fn output_hint() -> String {
         format!("dict[{}, {}]", K::output_hint(), V::output_hint())
     }
+    fn __shape() -> ViewShape {
+        ViewShape::Dict(Box::new(V::__shape()))
+    }
+    fn __view_hint() -> String {
+        mapping_view_hint::<K, V>()
+    }
+    fn __input_hint() -> String {
+        format!("dict[{}, {}]", K::__input_hint(), V::__input_hint())
+    }
 }
 
 /// Accepts a `dict` (or subclass).
@@ -877,6 +1072,15 @@ impl<T: IntoObject, S> IntoObject for HashSet<T, S> {
     }
     fn output_hint() -> String {
         format!("set[{}]", T::output_hint())
+    }
+    fn __shape() -> ViewShape {
+        ViewShape::Set
+    }
+    fn __view_hint() -> String {
+        set_view_hint::<T>()
+    }
+    fn __input_hint() -> String {
+        set_input_hint::<T>()
     }
 }
 
@@ -907,6 +1111,15 @@ impl<T: IntoObject> IntoObject for BTreeSet<T> {
     }
     fn output_hint() -> String {
         format!("set[{}]", T::output_hint())
+    }
+    fn __shape() -> ViewShape {
+        ViewShape::Set
+    }
+    fn __view_hint() -> String {
+        set_view_hint::<T>()
+    }
+    fn __input_hint() -> String {
+        set_input_hint::<T>()
     }
 }
 
@@ -940,6 +1153,10 @@ macro_rules! tuple_impls {
             }
             fn output_hint() -> String {
                 let parts: &[String] = &[$($name::output_hint()),+];
+                format!("tuple[{}]", parts.join(", "))
+            }
+            fn __input_hint() -> String {
+                let parts: &[String] = &[$($name::__input_hint()),+];
                 format!("tuple[{}]", parts.join(", "))
             }
         }

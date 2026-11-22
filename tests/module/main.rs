@@ -6,6 +6,7 @@ mod classes;
 mod functions;
 mod mylib_def;
 mod semantics;
+mod stubs;
 mod views;
 
 use orochi::Scope;

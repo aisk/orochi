@@ -21,10 +21,11 @@ use std::marker::PhantomData;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 pub use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyCFunction, PyDict, PyList, PyModule, PySet};
+use pyo3::types::{PyCFunction, PyDict, PyList, PyModule, PySet, PyType};
 use pyo3::{PyClassGuard, PyClassGuardMut};
 
 use crate::class::{Class, Ref, RefGuard, RefMutGuard};
+pub use crate::convert::ViewShape;
 use crate::convert::{FromObject, IntoObject};
 use crate::error::{Error, Result};
 use crate::object::Object;
@@ -37,54 +38,124 @@ pub type PyResultObject = PyResult<Py<PyAny>>;
 
 // ---------------------------------------------------------------- container views
 
-static VIEWS: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+const VIEWS_SOURCE: &str = include_str!("views.py");
 
-/// The Python module with the live container views (`views.py`), created
-/// on first use.
-fn views(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
-    let module = VIEWS.get_or_try_init(py, || -> PyResult<Py<PyModule>> {
-        let code = CString::new(include_str!("views.py")).expect("no NUL in views.py");
-        Ok(PyModule::from_code(py, &code, c"orochi/views.py", c"orochi._views")?.unbind())
-    })?;
-    Ok(module.bind(py))
+/// FNV-1a hash of a text, at compile time.
+const fn fnv1a(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        i += 1;
+    }
+    hash
 }
 
-/// The current contents (a real `list`/`dict`/`set`) of `obj` if it is one
-/// of orochi's container views.
-fn view_contents<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+/// The views module of this orochi version and its `View` base class.
+struct Views {
+    module: Py<PyModule>,
+    view: Py<PyType>,
+}
+
+static VIEWS: PyOnceLock<Views> = PyOnceLock::new();
+
+/// Name prefix of the views modules in `sys.modules`.
+const VIEWS_PREFIX: &str = "orochi._views_";
+
+/// The Python module with the live container views (`views.py`), loaded on
+/// first use. It is registered in `sys.modules` under a name tagged with a
+/// hash of its source, and reused from there when another extension built
+/// with the same orochi loaded it first, so that both recognize each other's
+/// views.
+fn views(py: Python<'_>) -> PyResult<&Views> {
+    VIEWS.get_or_try_init(py, || -> PyResult<Views> {
+        let tag = format!("{:016x}", fnv1a(VIEWS_SOURCE));
+        let module = load_views(py, &format!("{VIEWS_PREFIX}{tag}"), &tag, VIEWS_SOURCE)?;
+        let view = module.bind(py).getattr("View")?.cast_into::<PyType>()?.unbind();
+        Ok(Views { module, view })
+    })
+}
+
+/// `sys.modules[name]` if it is a views module tagged `tag`; otherwise the
+/// views module built from `source`, tagged and registered as `name`
+/// (replacing an incompatible module of that name).
+fn load_views(py: Python<'_>, name: &str, tag: &str, source: &str) -> PyResult<Py<PyModule>> {
+    let modules = py.import("sys")?.getattr("modules")?;
+    if let Ok(existing) = modules.get_item(name)
+        && let Ok(module) = existing.cast::<PyModule>()
+        && let Ok(existing_tag) = module.getattr("_TAG")
+        && existing_tag.eq(tag)?
+    {
+        return Ok(module.clone().unbind());
+    }
+    let code = CString::new(source).expect("no NUL in views.py");
+    let module_name = CString::new(name).expect("no NUL in the module name");
+    // `from_code` would execute into a module already registered as `name`.
+    if modules.contains(name)? {
+        modules.del_item(name)?;
+    }
+    // Registers the module in `sys.modules` as `name`.
+    let module = PyModule::from_code(py, &code, c"orochi/views.py", &module_name)?;
+    module.setattr("_TAG", tag)?;
+    modules.set_item(name, &module)?;
+    Ok(module.unbind())
+}
+
+/// Whether `obj` is one of orochi's container views.
+fn is_view(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = obj.py();
-    // No view can exist before the module was created.
-    let Some(module) = VIEWS.get(py) else {
-        return Ok(None);
+    let views = match VIEWS.get(py) {
+        Some(views) => views,
+        // This extension has created no view yet; one from another extension
+        // built with the same orochi still counts.
+        None => {
+            let from_views = obj
+                .get_type()
+                .getattr("__module__")
+                .is_ok_and(|m| m.extract::<&str>().is_ok_and(|m| m.starts_with(VIEWS_PREFIX)));
+            if !from_views {
+                return Ok(false);
+            }
+            views(py)?
+        }
     };
-    if obj.is_instance(&module.bind(py).getattr("View")?)? {
-        Ok(Some(obj.call_method0("_get")?))
-    } else {
-        Ok(None)
+    obj.is_instance(views.view.bind(py))
+}
+
+/// The Python form of a [`ViewShape`] (see `views.py`).
+fn shape_object<'py>(py: Python<'py>, shape: &ViewShape) -> PyResult<Bound<'py, PyAny>> {
+    let pair = |kind: &str, inner: Option<&ViewShape>| -> PyResult<Bound<'py, PyAny>> {
+        let inner = match inner {
+            Some(inner) => shape_object(py, inner)?,
+            None => py.None().into_bound(py),
+        };
+        Ok((kind, inner).into_pyobject(py)?.into_any())
+    };
+    match shape {
+        ViewShape::Plain => Ok(py.None().into_bound(py)),
+        ViewShape::List(inner) => pair("list", Some(inner)),
+        ViewShape::Dict(inner) => pair("dict", Some(inner)),
+        ViewShape::Set => pair("set", None),
+        ViewShape::Array(inner) => pair("array", Some(inner)),
     }
 }
 
-/// Reads the field through `get`; a `list`/`dict`/`set` is returned as a
-/// live view bound to the instance and the field.
+/// Reads the field through `get`; the positions `shape` marks are returned
+/// as live views bound to the instance and the field.
 fn live_field<C: Class>(
     slf: &Bound<'_, C>,
     name: &'static str,
+    shape: &ViewShape,
     get: RawGet,
     set: RawSet,
 ) -> PyResultObject {
     let py = slf.py();
     let value = get(slf.as_any())?;
-    let b = value.bind(py);
-    let kind = if b.is_exact_instance_of::<PyList>() {
-        "ListView"
-    } else if b.is_exact_instance_of::<PyDict>() {
-        "DictView"
-    } else if b.is_exact_instance_of::<PySet>() {
-        "SetView"
-    } else {
-        // `None` of an `Option<Vec<T>>`, `bytes` of a `Vec<u8>`, ...
+    if *shape == ViewShape::Plain || value.is_none(py) {
         return Ok(value);
-    };
+    }
     let owner: Py<PyAny> = slf.clone().into_any().unbind();
     let key = (owner.as_ptr() as usize, name);
     let owner_get = owner.clone_ref(py);
@@ -96,28 +167,51 @@ fn live_field<C: Class>(
         set(owner.bind(args.py()), value)
     })?;
     Ok(views(py)?
-        .getattr(kind)?
-        .call1((getter, setter, key))?
+        .module
+        .bind(py)
+        .getattr("_wrap")?
+        .call1((shape_object(py, shape)?, value, getter, setter, key))?
         .unbind())
 }
 
 // ---------------------------------------------------------------- arguments
 
-/// Converts a required argument. orochi's container views are accepted
-/// wherever their contents would be.
+/// Converts a required argument. An orochi container view is converted from
+/// its (plain) contents, except into a handle type (`List`, ...), which
+/// would silently refer to a detached copy.
 pub fn arg<T: FromObject>(value: Py<PyAny>, what: &str) -> PyResult<T> {
     let obj = Object::from_py(value);
-    match T::from_object(&obj) {
-        Ok(v) => Ok(v),
-        Err(err) => {
-            let contents =
-                attach(|py| view_contents(obj.bind(py)).map(|c| c.map(|c| Object::from_bound(c))))?;
-            match contents {
-                Some(contents) => T::from_object(&contents).map_err(|err| contextualize(err, what)),
-                None => Err(contextualize(err, what)),
-            }
+    let plain = attach(|py| -> PyResult<Option<Object>> {
+        let b = obj.bind(py);
+        if !is_view(b)? {
+            return Ok(None);
         }
+        if let Some(builtin) = T::__HANDLE_OF {
+            return Err(contextualize(view_to_handle_error(b, builtin)?, what));
+        }
+        Ok(Some(Object::from_bound(b.call_method0("_get")?)))
+    })?;
+    let obj = plain.unwrap_or(obj);
+    T::from_object(&obj).map_err(|err| contextualize(err, what))
+}
+
+/// The error for a view passed where a handle to a `builtin` is expected.
+fn view_to_handle_error(view: &Bound<'_, PyAny>, builtin: &str) -> PyResult<Error> {
+    let kind: String = view.getattr("_builtin")?.getattr("__name__")?.extract()?;
+    if kind != builtin {
+        return Ok(crate::convert::type_mismatch(builtin, view));
     }
+    let rust = match builtin {
+        "list" => "&mut Vec<T>",
+        "dict" => "&mut HashMap<K, V>",
+        _ => "&mut HashSet<T>",
+    };
+    let got = view.get_type().name()?;
+    Ok(Error::type_error(format!(
+        "expected {builtin}, got {got}, a live view of a field, which is not a {builtin} \
+         object; to change the field in place, the parameter must be `{rust}` instead of a \
+         handle, or pass `{builtin}(view)` to pass a copy"
+    )))
 }
 
 /// Converts an argument that defaults to `None` when omitted.
@@ -155,21 +249,21 @@ fn contextualize(err: Error, what: &str) -> PyErr {
 }
 
 /// Rejects the same object (or the same field, through views) passed to two
-/// `&mut` parameters, like pyo3's "Already borrowed" for class instances.
+/// `&mut` parameters, like pyo3's "Already borrowed" for class instances. A
+/// view also conflicts with a view of a position inside it, and with the
+/// instance whose field it views.
 pub fn check_aliasing(args: &[(&Py<PyAny>, &str)]) -> PyResult<()> {
     attach(|py| {
+        let module = views(py)?.module.bind(py);
+        let alias_key = module.getattr("alias_key")?;
+        let aliased = module.getattr("aliased")?;
         let mut keys: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len());
         for (obj, _) in args {
-            let obj = obj.bind(py);
-            let key = match VIEWS.get(py) {
-                Some(module) => module.bind(py).call_method1("alias_key", (obj,))?,
-                None => (obj.as_ptr() as usize).into_pyobject(py)?.into_any(),
-            };
-            keys.push(key);
+            keys.push(alias_key.call1((obj.bind(py),))?);
         }
         for (j, key) in keys.iter().enumerate() {
             for (i, earlier) in keys[..j].iter().enumerate() {
-                if key.eq(earlier)? {
+                if aliased.call1((key, earlier))?.is_truthy()? {
                     return Err(PyRuntimeError::new_err(format!(
                         "Already borrowed: {} refers to the same object as {}, which is \
                          already lent mutably to this call",
@@ -306,7 +400,8 @@ impl<T: ?Sized> OwnedParam<T> {
             if T::accepts(b) {
                 return Ok(Some((Object::from_bound(b.clone()), None)));
             }
-            if let Some(contents) = view_contents(b)?
+            if is_view(b)?
+                && let contents = b.call_method0("_get")?
                 && T::accepts(&contents)
             {
                 return Ok(Some((
@@ -378,12 +473,28 @@ pub trait WriteBack: FromObject {
     /// Updates `obj` in place to hold `value`; returns whether anything
     /// changed.
     fn write_back(value: Self, obj: &Object) -> Result<bool>;
+    /// Type hint of the accepted argument: only the builtin container itself
+    /// can be written back (`list[int]`, not `Sequence[int]`), or a live
+    /// view of a field (`list[int] | ListView[int, int, int]`). Elements
+    /// have their output hints: they are what the caller reads back.
+    fn mut_hint() -> String;
+}
+
+/// `plain`, or `plain | <view hint>` if `T` is read as a view.
+fn or_view<T: IntoObject>(plain: String) -> String {
+    match T::__shape() {
+        ViewShape::Plain => plain,
+        _ => format!("{plain} | {}", T::__view_hint()),
+    }
 }
 
 impl<T: FromObject + IntoObject> WriteBack for Vec<T> {
     const EXPECTED: &'static str = "list";
     fn accepts(obj: &Bound<'_, PyAny>) -> bool {
         obj.is_instance_of::<PyList>()
+    }
+    fn mut_hint() -> String {
+        or_view::<Self>(format!("list[{}]", T::output_hint()))
     }
     fn write_back(value: Self, obj: &Object) -> Result<bool> {
         // `xs[:] = new`, unless the contents are element-wise equal (a
@@ -464,6 +575,9 @@ where
     fn accepts(obj: &Bound<'_, PyAny>) -> bool {
         obj.is_instance_of::<PyDict>()
     }
+    fn mut_hint() -> String {
+        or_view::<Self>(format!("dict[{}, {}]", K::output_hint(), V::output_hint()))
+    }
     fn write_back(value: Self, obj: &Object) -> Result<bool> {
         write_back_dict(obj, value.into_object()?)
     }
@@ -477,6 +591,9 @@ where
     const EXPECTED: &'static str = "dict";
     fn accepts(obj: &Bound<'_, PyAny>) -> bool {
         obj.is_instance_of::<PyDict>()
+    }
+    fn mut_hint() -> String {
+        or_view::<Self>(format!("dict[{}, {}]", K::output_hint(), V::output_hint()))
     }
     fn write_back(value: Self, obj: &Object) -> Result<bool> {
         write_back_dict(obj, value.into_object()?)
@@ -492,6 +609,9 @@ where
     fn accepts(obj: &Bound<'_, PyAny>) -> bool {
         obj.is_instance_of::<PySet>()
     }
+    fn mut_hint() -> String {
+        or_view::<Self>(format!("set[{}]", T::output_hint()))
+    }
     fn write_back(value: Self, obj: &Object) -> Result<bool> {
         write_back_set(obj, value.into_object()?)
     }
@@ -501,6 +621,9 @@ impl<T: FromObject + IntoObject + Ord> WriteBack for std::collections::BTreeSet<
     const EXPECTED: &'static str = "set";
     fn accepts(obj: &Bound<'_, PyAny>) -> bool {
         obj.is_instance_of::<PySet>()
+    }
+    fn mut_hint() -> String {
+        or_view::<Self>(format!("set[{}]", T::output_hint()))
     }
     fn write_back(value: Self, obj: &Object) -> Result<bool> {
         write_back_set(obj, value.into_object()?)
@@ -834,15 +957,6 @@ pub fn raw_set<C: Class, T: FromObject>(
     set_field(obj.cast::<C>()?, value, what, field)
 }
 
-/// Field types read as live views: `Vec`, maps and sets (also in `Option`).
-pub trait LiveContainer {}
-
-impl<T> LiveContainer for Vec<T> {}
-impl<K, V, S> LiveContainer for std::collections::HashMap<K, V, S> {}
-impl<K, V> LiveContainer for std::collections::BTreeMap<K, V> {}
-impl<T, S> LiveContainer for std::collections::HashSet<T, S> {}
-impl<T> LiveContainer for std::collections::BTreeSet<T> {}
-impl<T: LiveContainer> LiveContainer for Option<T> {}
 
 /// Selects how a field getter returns the field.
 pub struct FieldSpec<T>(PhantomData<fn() -> T>);
@@ -859,13 +973,15 @@ impl<T> Default for FieldSpec<T> {
     }
 }
 
-pub trait LiveFieldKind {
-    fn field_kind(&self) -> LiveField;
+/// Fields of a convertible type: container positions (by the type's
+/// [`ViewShape`]) are read as live views.
+pub trait LiveFieldKind<T> {
+    fn field_kind(&self) -> LiveField<T>;
 }
 
-impl<T: LiveContainer> LiveFieldKind for &FieldSpec<T> {
-    fn field_kind(&self) -> LiveField {
-        LiveField
+impl<T: IntoObject> LiveFieldKind<T> for &FieldSpec<T> {
+    fn field_kind(&self) -> LiveField<T> {
+        LiveField(PhantomData)
     }
 }
 
@@ -879,9 +995,9 @@ impl<T> CopyFieldKind for FieldSpec<T> {
     }
 }
 
-pub struct LiveField;
+pub struct LiveField<T>(PhantomData<fn() -> T>);
 
-impl LiveField {
+impl<T: IntoObject> LiveField<T> {
     pub fn get<C: Class>(
         &self,
         slf: &Bound<'_, C>,
@@ -889,7 +1005,7 @@ impl LiveField {
         get: RawGet,
         set: RawSet,
     ) -> PyResultObject {
-        live_field(slf, name, get, set)
+        live_field(slf, name, &T::__shape(), get, set)
     }
 }
 
@@ -919,11 +1035,40 @@ pub fn class_from_object<C: Class + Clone>(obj: &Object) -> Result<C> {
     Ok(copy)
 }
 
-/// `IntoObject` for an enum: the member singleton stored on the class.
-pub fn enum_member<C: Class>(name: &str) -> Result<Object> {
-    attach(|py| {
-        let member = py.get_type::<C>().getattr(name)?;
-        Ok(Object::from_bound(member))
+/// The member objects of an enum class, by variant index (`None` for a
+/// variant compiled out with `#[cfg]`).
+pub type EnumMembers = PyOnceLock<Vec<Option<Py<PyAny>>>>;
+
+/// Reads the member singletons of the enum class `C` (named `names`, in
+/// variant order) into `cache`, once. The generated module init calls this
+/// right after creating the class, so later conversions return these
+/// objects even if the class attributes are reassigned.
+pub fn enum_members<'a, C: Class>(
+    py: Python<'_>,
+    cache: &'a EnumMembers,
+    names: &[&str],
+) -> PyResult<&'a [Option<Py<PyAny>>]> {
+    let members = cache.get_or_try_init(py, || -> PyResult<_> {
+        let class = py.get_type::<C>();
+        Ok(names
+            .iter()
+            .map(|name| class.getattr(*name).ok().map(Bound::unbind))
+            .collect())
+    })?;
+    Ok(members)
+}
+
+/// The `__orochi_members` function of an enum: its cached members.
+pub type MembersFn = for<'py> fn(Python<'py>) -> PyResult<&'static [Option<Py<PyAny>>]>;
+
+/// `IntoObject` for an enum: the cached member singleton of variant `index`.
+pub fn enum_member(
+    members: MembersFn,
+    index: usize,
+) -> Result<Object> {
+    attach(|py| match members(py)?.get(index) {
+        Some(Some(member)) => Ok(Object::from_py(member.clone_ref(py))),
+        _ => Err(Error::runtime_error("enum member missing from its class")),
     })
 }
 
@@ -1028,4 +1173,318 @@ pub fn module_object(
         })?;
         Ok(Object::from_py(module.clone_ref(py).into_any()))
     })
+}
+
+// ---------------------------------------------------------------- type stubs
+
+/// The description of a module that `.pyi` stubs are rendered from.
+pub mod stub {
+    pub use crate::stubs::{Class, Function, Module, Param};
+
+    /// The [`Stubs`](crate::Stubs) of a root module.
+    pub fn stubs(root: Module) -> crate::Stubs {
+        crate::Stubs::new(root)
+    }
+}
+
+/// Type hints of parameters, return values and fields, selected with
+/// autoref specialization like the conversions above: the generated code
+/// calls e.g. `(&&&Hint::<T>::new()).borrowed()`, and the most specific
+/// implementation that applies to `T` wins. Types without a conversion (the
+/// wrapper reports those) fall back to `typing.Any` instead of repeating the
+/// compile error.
+pub mod hint {
+    use std::marker::PhantomData;
+
+    use super::WriteBack;
+    use crate::class::Class;
+    use crate::convert::{FromObject, IntoObject, ViewShape};
+
+    const ANY: &str = "typing.Any";
+
+    pub struct Hint<T: ?Sized>(PhantomData<fn() -> *const T>);
+
+    impl<T: ?Sized> Hint<T> {
+        pub fn new() -> Self {
+            Hint(PhantomData)
+        }
+    }
+
+    impl<T: ?Sized> Default for Hint<T> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// `T | None`, without repeating `None` (the renderer dedupes unions).
+    pub fn optional(hint: String) -> String {
+        format!("{hint} | None")
+    }
+
+    // By-value parameters and field setters: `(&&Hint::<T>::new()).input()`.
+
+    pub trait InputHint {
+        fn input(&self) -> String;
+    }
+
+    impl<T: FromObject> InputHint for &Hint<T> {
+        fn input(&self) -> String {
+            T::input_hint()
+        }
+    }
+
+    pub trait InputHintAny {
+        fn input(&self) -> String;
+    }
+
+    impl<T: ?Sized> InputHintAny for Hint<T> {
+        fn input(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+
+    // `&T` and `Option<&T>` parameters: `(&&&Hint::<T>::new()).borrowed()`.
+
+    pub trait BorrowedClassHint {
+        fn borrowed(&self) -> String;
+    }
+
+    impl<T: Class> BorrowedClassHint for &&Hint<T> {
+        fn borrowed(&self) -> String {
+            T::PYTHON_NAME.to_owned()
+        }
+    }
+
+    pub trait BorrowedHint {
+        fn borrowed(&self) -> String;
+    }
+
+    impl<T: ?Sized + ToOwned> BorrowedHint for &Hint<T>
+    where
+        T::Owned: FromObject,
+    {
+        fn borrowed(&self) -> String {
+            <T::Owned as FromObject>::input_hint()
+        }
+    }
+
+    pub trait BorrowedHintAny {
+        fn borrowed(&self) -> String;
+    }
+
+    impl<T: ?Sized> BorrowedHintAny for Hint<T> {
+        fn borrowed(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+
+    // `&mut T` parameters: `(&&&Hint::<T>::new()).mutable()`.
+
+    pub trait MutableClassHint {
+        fn mutable(&self) -> String;
+    }
+
+    impl<T: Class> MutableClassHint for &&Hint<T> {
+        fn mutable(&self) -> String {
+            T::PYTHON_NAME.to_owned()
+        }
+    }
+
+    pub trait MutableHint {
+        fn mutable(&self) -> String;
+    }
+
+    impl<T: WriteBack> MutableHint for &Hint<T> {
+        fn mutable(&self) -> String {
+            T::mut_hint()
+        }
+    }
+
+    pub trait MutableHintAny {
+        fn mutable(&self) -> String;
+    }
+
+    impl<T: ?Sized> MutableHintAny for Hint<T> {
+        fn mutable(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+
+    // Return values and constants: `(&&&Hint::<T>::new()).output()`.
+    // `Result<T, E>` is `T`, also when `E` is only `Display`.
+
+    pub trait OutputResultHint {
+        fn output(&self) -> String;
+    }
+
+    impl<T: IntoObject, E> OutputResultHint for &&Hint<std::result::Result<T, E>> {
+        fn output(&self) -> String {
+            T::output_hint()
+        }
+    }
+
+    pub trait OutputHint {
+        fn output(&self) -> String;
+    }
+
+    impl<T: IntoObject> OutputHint for &Hint<T> {
+        fn output(&self) -> String {
+            T::output_hint()
+        }
+    }
+
+    pub trait OutputHintAny {
+        fn output(&self) -> String;
+    }
+
+    impl<T: ?Sized> OutputHintAny for Hint<T> {
+        fn output(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+
+    // Field getters: `(&&Hint::<T>::new()).field()`; container positions are
+    // read as live views.
+
+    pub trait FieldHint {
+        fn field(&self) -> String;
+    }
+
+    impl<T: IntoObject> FieldHint for &Hint<T> {
+        fn field(&self) -> String {
+            T::__view_hint()
+        }
+    }
+
+    pub trait FieldHintAny {
+        fn field(&self) -> String;
+    }
+
+    impl<T: ?Sized> FieldHintAny for Hint<T> {
+        fn field(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+
+    // Field setters: `(&&&Hint::<T>::new()).setter()`; a field read as a
+    // view also accepts a view (of another instance, say).
+
+    pub trait SetterViewHint {
+        fn setter(&self) -> String;
+    }
+
+    impl<T: FromObject + IntoObject> SetterViewHint for &&Hint<T> {
+        fn setter(&self) -> String {
+            match T::__shape() {
+                // An array reads as a plain `list`, which the input accepts.
+                ViewShape::Plain | ViewShape::Array(_) => T::input_hint(),
+                _ => format!("{} | {}", T::input_hint(), T::__view_hint()),
+            }
+        }
+    }
+
+    pub trait SetterHint {
+        fn setter(&self) -> String;
+    }
+
+    impl<T: FromObject> SetterHint for &Hint<T> {
+        fn setter(&self) -> String {
+            T::input_hint()
+        }
+    }
+
+    pub trait SetterHintAny {
+        fn setter(&self) -> String;
+    }
+
+    impl<T: ?Sized> SetterHintAny for Hint<T> {
+        fn setter(&self) -> String {
+            ANY.to_owned()
+        }
+    }
+}
+
+/// Adds the hidden `_orochi_stubs(out_dir=None)` function to a root module:
+/// it returns `{relative path: text}` of the module's `.pyi` stubs and, given
+/// a directory, also writes them there.
+pub fn add_stubs_helper(module: &Bound<'_, PyModule>, stubs: fn() -> crate::Stubs) -> PyResult<()> {
+    let py = module.py();
+    let function = PyCFunction::new_closure(
+        py,
+        Some(c"_orochi_stubs"),
+        Some(
+            c"_orochi_stubs(out_dir=None)\n--\n\n\
+              Type stubs (.pyi) of this module, generated by orochi.\n\n\
+              Returns {relative path: text}; if out_dir is given, also writes the files \
+              there (e.g. out_dir/name.pyi, or out_dir/name/__init__.pyi and one file per \
+              submodule).",
+        ),
+        move |args, kwargs| -> PyResultObject {
+            let py = args.py();
+            let mut out_dir: Option<Bound<'_, PyAny>> = match args.len() {
+                0 => None,
+                1 => Some(args.get_item(0)?),
+                n => {
+                    return Err(PyTypeError::new_err(format!(
+                        "_orochi_stubs() takes at most 1 argument ({n} given)"
+                    )));
+                }
+            };
+            if let Some(kwargs) = kwargs {
+                for (key, value) in kwargs.iter() {
+                    if key.extract::<String>().ok().as_deref() != Some("out_dir")
+                        || out_dir.is_some()
+                    {
+                        return Err(PyTypeError::new_err(format!(
+                            "_orochi_stubs() got an unexpected keyword argument {key}"
+                        )));
+                    }
+                    out_dir = Some(value);
+                }
+            }
+            let stubs = stubs();
+            if let Some(dir) = out_dir.filter(|d| !d.is_none()) {
+                let dir: std::path::PathBuf = arg(dir.unbind(), "argument 'out_dir'")?;
+                crate::stubs::write_stubs(&stubs, dir).map_err(Error::from)?;
+            }
+            let files = PyDict::new(py);
+            for (path, text) in stubs.files() {
+                files.set_item(path, text)?;
+            }
+            Ok(files.into_any().unbind())
+        },
+    )?;
+    // Not `add`: that would list it in `__all__`.
+    module.setattr("_orochi_stubs", function)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn views_module_is_reused_only_when_compatible() {
+        attach(|py| -> PyResult<()> {
+            let name = "orochi._views_unit_test";
+            let modules = py.import("sys")?.getattr("modules")?;
+            // Not loaded yet: a new module, tagged and registered.
+            let first = load_views(py, name, "t1", VIEWS_SOURCE)?;
+            let first = first.bind(py);
+            assert!(modules.get_item(name)?.is(first));
+            assert_eq!(first.getattr("_TAG")?.extract::<String>()?, "t1");
+            assert!(first.hasattr("ListView")?);
+            // Loaded with the same tag (by another extension): reused.
+            assert!(load_views(py, name, "t1", VIEWS_SOURCE)?.bind(py).is(first));
+            // Another tag, or something else under that name: replaced.
+            let second = load_views(py, name, "t2", VIEWS_SOURCE)?;
+            assert!(!second.bind(py).is(first));
+            assert!(modules.get_item(name)?.is(second.bind(py)));
+            modules.set_item(name, "not a module")?;
+            let third = load_views(py, name, "t2", VIEWS_SOURCE)?;
+            assert!(modules.get_item(name)?.is(third.bind(py)));
+            modules.del_item(name)?;
+            Ok(())
+        })
+        .unwrap();
+    }
 }

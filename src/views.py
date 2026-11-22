@@ -8,9 +8,18 @@ that copy and, for mutating operations, stores the copy back through the
 field's setter. The setter converts strictly, so an element of the wrong type
 raises `TypeError` at once and leaves the field unchanged.
 
-An element read through a view that is itself a `list`/`dict`/`set` is
-returned as a child view that addresses its position (index or key) in the
-parent, so `obj.rows[0].append(1)` changes the field too.
+Which positions are views is decided by the Rust field type, described by a
+*shape*: `None` (returned as it is), `("list", inner)`, `("dict", inner)`
+(values of shape `inner`), `("set", None)`, or `("array", inner)`: a
+fixed-size array, returned as a plain `list` whose elements have shape
+`inner`. An element read through a view whose shape is a container is a child
+view that addresses its position (index or key) in the parent, so
+`obj.rows[0].append(1)` changes the field too.
+
+Mutating operations hold one module-wide re-entrant lock from reading the
+field to writing it back, so concurrent view operations from several threads
+do not lose each other's updates. Other writers (assigning the field, Rust
+methods) do not take the lock.
 
 This module is an implementation detail of orochi.
 """
@@ -18,8 +27,16 @@ This module is an implementation detail of orochi.
 from collections.abc import MutableMapping, MutableSequence, MutableSet, Set
 import copy as _copy
 import operator as _operator
+import threading as _threading
 
 __all__ = ["View", "ListView", "DictView", "SetView"]
+
+# Identifies this version of the module (set by orochi after loading it):
+# an extension built with the same orochi reuses an already loaded copy
+# (see `views()` in private.rs).
+_TAG = None
+
+_LOCK = _threading.RLock()
 
 
 def _plain(value):
@@ -29,14 +46,51 @@ def _plain(value):
     return value
 
 
+def _wrap(shape, value, get, set, key):
+    """`value`, read at a position of `shape`, as a view if the shape says so.
+
+    `get()` reads the position again, `set(new)` replaces it, `key`
+    identifies it (for alias checks).
+    """
+    if shape is None or value is None:
+        return value
+    kind, inner = shape
+    if kind == "array":
+        if type(value) is not list:
+            return value
+        return [
+            _wrap(inner, item, _item_get(get, i), _item_set(get, set, i), key + (i,))
+            for i, item in enumerate(value)
+        ]
+    cls = _VIEW_TYPES[kind]
+    if type(value) is not cls._builtin:
+        return value
+    return cls(get, set, key, shape)
+
+
+def _item_get(get, index):
+    return lambda: get()[index]
+
+
+def _item_set(get, set, index):
+    def set_item(new):
+        with _LOCK:
+            value = get()
+            value[index] = new
+            set(value)
+
+    return set_item
+
+
 class View:
-    __slots__ = ("_get_raw", "_set_raw", "_key")
+    __slots__ = ("_get_raw", "_set_raw", "_key", "_shape")
     _builtin = object
 
-    def __init__(self, get, set, key):
+    def __init__(self, get, set, key, shape):
         self._get_raw = get
         self._set_raw = set
         self._key = key
+        self._shape = shape
 
     def _get(self):
         value = self._get_raw()
@@ -48,14 +102,15 @@ class View:
         return value
 
     def _mutate(self, operation):
-        value = self._get()
-        result = operation(value)
-        self._set_raw(value)
-        return result
+        with _LOCK:
+            value = self._get()
+            result = operation(value)
+            self._set_raw(value)
+            return result
 
     def _child(self, key, value):
-        kind = _VIEW_TYPES.get(type(value))
-        if kind is None:
+        inner = self._shape[1]
+        if inner is None or value is None:
             return value
 
         def get():
@@ -64,10 +119,19 @@ class View:
         def set(new):
             self._mutate(lambda c: c.__setitem__(key, new))
 
-        return kind(get, set, self._key + (key,))
+        return _wrap(inner, value, get, set, self._key + (key,))
+
+    def _other(self, other):
+        """`other` as a builtin of this view's type, or `NotImplemented`."""
+        if isinstance(other, View):
+            return other._get() if other._builtin is self._builtin else NotImplemented
+        if isinstance(other, self._builtin):
+            return other
+        return NotImplemented
 
     def copy(self):
-        """A real builtin copy of the current contents."""
+        """A plain builtin copy of the current contents (nested containers
+        are plain builtins too)."""
         return self._get().copy()
 
     __copy__ = copy
@@ -91,10 +155,14 @@ class View:
         return bool(self._get())
 
     def __eq__(self, other):
-        return self._get() == _plain(other)
+        other = self._other(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return self._get() == other
 
     def __ne__(self, other):
-        return self._get() != _plain(other)
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
 
     __hash__ = None
 
@@ -113,7 +181,7 @@ class ListView(View, MutableSequence):
     def __getitem__(self, index):
         value = self._get()
         if isinstance(index, slice):
-            return value[index]
+            return [self._child(i, value[i]) for i in range(len(value))[index]]
         item = value[index]
         return self._child(self._index(index, len(value)), item)
 
@@ -139,25 +207,32 @@ class ListView(View, MutableSequence):
     def __contains__(self, item):
         return _plain(item) in self._get()
 
+    def _compare(self, other, operation):
+        other = self._other(other)
+        return NotImplemented if other is NotImplemented else operation(self._get(), other)
+
     def __lt__(self, other):
-        return self._get() < _plain(other)
+        return self._compare(other, _operator.lt)
 
     def __le__(self, other):
-        return self._get() <= _plain(other)
+        return self._compare(other, _operator.le)
 
     def __gt__(self, other):
-        return self._get() > _plain(other)
+        return self._compare(other, _operator.gt)
 
     def __ge__(self, other):
-        return self._get() >= _plain(other)
+        return self._compare(other, _operator.ge)
 
     def __add__(self, other):
-        return self._get() + _plain(other)
+        return self._compare(other, _operator.add)
 
     def __radd__(self, other):
-        return _plain(other) + self._get()
+        other = self._other(other)
+        return NotImplemented if other is NotImplemented else other + self._get()
 
     def __mul__(self, n):
+        if not hasattr(type(n), "__index__"):
+            return NotImplemented
         return self._get() * n
 
     __rmul__ = __mul__
@@ -244,10 +319,11 @@ class DictView(View, MutableMapping):
         return self._mutate(lambda c: c.popitem())
 
     def setdefault(self, key, default=None):
-        if key not in self._get():
-            default = _plain(default)
-            self._mutate(lambda c: c.__setitem__(key, default))
-        return self[key]
+        default = _plain(default)
+        with _LOCK:
+            if key not in self._get():
+                self._mutate(lambda c: c.__setitem__(key, default))
+            return self[key]
 
     def update(self, *args, **kwargs):
         new = dict(*args, **kwargs)
@@ -257,11 +333,18 @@ class DictView(View, MutableMapping):
     def clear(self):
         self._mutate(lambda c: c.clear())
 
+    @classmethod
+    def fromkeys(cls, iterable, value=None):
+        """A new plain `dict`, like `dict.fromkeys`."""
+        return dict.fromkeys(iterable, value)
+
     def __or__(self, other):
-        return self._get() | _plain(other)
+        other = self._other(other)
+        return NotImplemented if other is NotImplemented else self._get() | other
 
     def __ror__(self, other):
-        return _plain(other) | self._get()
+        other = self._other(other)
+        return NotImplemented if other is NotImplemented else other | self._get()
 
     def __ior__(self, other):
         self.update(_plain(other))
@@ -278,6 +361,9 @@ class SetView(View, MutableSet):
     @classmethod
     def _from_iterable(cls, iterable):
         return set(iterable)
+
+    def _other(self, other):
+        return _as_set(other)
 
     def __iter__(self):
         return iter(list(self._get()))
@@ -337,21 +423,21 @@ class SetView(View, MutableSet):
     def isdisjoint(self, other):
         return self._get().isdisjoint(_plain(other))
 
-    def __or__(self, other):
+    def _binary(self, other, operation):
         other = _as_set(other)
-        return NotImplemented if other is NotImplemented else self._get() | other
+        return NotImplemented if other is NotImplemented else operation(self._get(), other)
+
+    def __or__(self, other):
+        return self._binary(other, _operator.or_)
 
     def __and__(self, other):
-        other = _as_set(other)
-        return NotImplemented if other is NotImplemented else self._get() & other
+        return self._binary(other, _operator.and_)
 
     def __sub__(self, other):
-        other = _as_set(other)
-        return NotImplemented if other is NotImplemented else self._get() - other
+        return self._binary(other, _operator.sub)
 
     def __xor__(self, other):
-        other = _as_set(other)
-        return NotImplemented if other is NotImplemented else self._get() ^ other
+        return self._binary(other, _operator.xor)
 
     def __rsub__(self, other):
         other = _as_set(other)
@@ -380,21 +466,17 @@ class SetView(View, MutableSet):
     def __ixor__(self, other):
         return self._inplace(other, set.__ixor__)
 
-    def _compare(self, other, operation):
-        other = _as_set(other)
-        return NotImplemented if other is NotImplemented else operation(self._get(), other)
-
     def __lt__(self, other):
-        return self._compare(other, _operator.lt)
+        return self._binary(other, _operator.lt)
 
     def __le__(self, other):
-        return self._compare(other, _operator.le)
+        return self._binary(other, _operator.le)
 
     def __gt__(self, other):
-        return self._compare(other, _operator.gt)
+        return self._binary(other, _operator.gt)
 
     def __ge__(self, other):
-        return self._compare(other, _operator.ge)
+        return self._binary(other, _operator.ge)
 
 
 def _as_set(other):
@@ -406,12 +488,20 @@ def _as_set(other):
         return set(other)
     return NotImplemented
 
-_VIEW_TYPES = {list: ListView, dict: DictView, set: SetView}
+
+_VIEW_TYPES = {"list": ListView, "dict": DictView, "set": SetView}
 
 
 def alias_key(obj):
-    """What a `&mut` argument refers to: a view's field position, otherwise
-    the object's identity."""
+    """What a `&mut` argument refers to: a view's position (owner id, field,
+    index or key, ...), otherwise `(id(obj),)`."""
     if isinstance(obj, View):
         return obj._key
-    return id(obj)
+    return (id(obj),)
+
+
+def aliased(a, b):
+    """Whether two `alias_key`s overlap: equal, or one inside the other (a
+    field of an instance, an element of a field)."""
+    n = min(len(a), len(b))
+    return a[:n] == b[:n]

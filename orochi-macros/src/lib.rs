@@ -185,9 +185,19 @@ fn is_pub(vis: &Visibility) -> bool {
 }
 
 /// Rejects Python keywords as exported names (`r#in` would be unusable from
-/// Python: `mylib.in` is a syntax error).
+/// Python: `mylib.in` is a syntax error), and names reserved for orochi
+/// (`_orochi_stubs` is the module's stub helper, `__orochi_*` generated code).
 fn check_python_name(cx: &mut Cx, name: &str, tokens: impl ToTokens, what: &str) {
-    if PYTHON_KEYWORDS.contains(&name) {
+    if name.starts_with("_orochi") || name.starts_with("__orochi") {
+        cx.error(
+            tokens,
+            format!(
+                "`{name}` cannot be the name of an exported {what}: names starting with \
+                 `_orochi` or `__orochi` are reserved for orochi; rename it, or make the item \
+                 private"
+            ),
+        );
+    } else if PYTHON_KEYWORDS.contains(&name) {
         cx.error(
             tokens,
             format!(
@@ -230,6 +240,11 @@ struct Class {
     names: Names,
     /// Items of the generated `#[pymethods]` block.
     methods: Vec<TokenStream2>,
+    /// Doc comments, as a `&'static str` expression.
+    doc: TokenStream2,
+    /// Statements adding members to `__orochi_class` in the generated stub
+    /// description.
+    stub_members: Vec<TokenStream2>,
 }
 
 impl Class {
@@ -247,6 +262,9 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
     let mut glue: Vec<TokenStream2> = Vec::new();
     let mut init: Vec<TokenStream2> = Vec::new();
     let mut wrappers: HashSet<String> = HashSet::new();
+    // Statements describing the module for `.pyi` stubs, in source order.
+    let mut stub_items: Vec<TokenStream2> = Vec::new();
+    let hint = quote!(::orochi::__private::hint::Hint);
 
     // Classes first, so that impl blocks anywhere in the module find them.
     let mut items_pending = Vec::new();
@@ -335,9 +353,10 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                 check_python_name(cx, &py_name, &f.sig.ident, "function");
                 names.add(cx, &py_name, &f.sig.ident, "module");
                 let wrapper = wrapper_ident("fn", &f.sig.ident, &mut wrappers);
-                if let Some(tokens) = function_wrapper(cx, &f, &wrapper) {
+                if let Some((tokens, stub)) = function_wrapper(cx, &f, &wrapper) {
                     let cfg = cfg_attrs(&f.attrs);
                     glue.push(tokens);
+                    stub_items.push(quote!(#(#cfg)* __orochi_module.function(#stub);));
                     init.push(quote! {
                         #(#cfg)*
                         ::orochi::__private::add_function(
@@ -379,6 +398,10 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                         __orochi_module, #name, #sub_full, #doc, #ident::__orochi_init,
                     )?;
                 });
+                stub_items.push(quote! {
+                    #(#cfg)*
+                    __orochi_module.module(#ident::__orochi_stub_module());
+                });
                 let mut sub_path = path.to_vec();
                 sub_path.push(name);
                 out_items.push(Item::Mod(process_module(cx, m, &sub_full, &sub_path)));
@@ -395,6 +418,11 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                 names.add(cx, &name, &c.ident, "module");
                 let ident = &c.ident;
                 let cfg = cfg_attrs(&c.attrs);
+                let ty = &c.ty;
+                stub_items.push(quote! {
+                    #(#cfg)*
+                    __orochi_module.constant(#name, (&&&#hint::<#ty>::new()).output());
+                });
                 init.push(quote_spanned! {c.ty.span()=>
                     #(#cfg)*
                     ::orochi::__private::add_value(__orochi_module, #name, &#ident)?;
@@ -413,6 +441,11 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                     names.add(cx, &name, &s.ident, "module");
                     let ident = &s.ident;
                     let cfg = cfg_attrs(&s.attrs);
+                    let ty = &s.ty;
+                    stub_items.push(quote! {
+                        #(#cfg)*
+                        __orochi_module.constant(#name, (&&&#hint::<#ty>::new()).output());
+                    });
                     init.push(quote_spanned! {s.ty.span()=>
                         #(#cfg)*
                         ::orochi::__private::add_value(__orochi_module, #name, &#ident)?;
@@ -452,6 +485,24 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                 );
                 out_items.push(Item::Union(u));
             }
+            Item::Struct(s) if is_pub(&s.vis) => {
+                let cfg = cfg_attrs(&s.attrs);
+                let ident = &s.ident;
+                stub_items.push(quote! {
+                    #(#cfg)*
+                    __orochi_module.class(#ident::__orochi_stub_class());
+                });
+                out_items.push(Item::Struct(s));
+            }
+            Item::Enum(e) if is_pub(&e.vis) => {
+                let cfg = cfg_attrs(&e.attrs);
+                let ident = &e.ident;
+                stub_items.push(quote! {
+                    #(#cfg)*
+                    __orochi_module.class(#ident::__orochi_stub_class());
+                });
+                out_items.push(Item::Enum(e));
+            }
             Item::ExternCrate(e) if is_pub(&e.vis) => {
                 cx.error(
                     &e,
@@ -470,12 +521,35 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
             #(#cfg)*
             ::orochi::__private::add_class::<#ident>(__orochi_module)?;
         });
+        if class.is_enum() {
+            init.push(quote! {
+                #(#cfg)*
+                #ident::__orochi_members(__orochi_module.py())?;
+            });
+        }
         glue.push(class_glue(class, full_name));
     }
 
     let doc = doc_expr(&item_mod.attrs);
+    let short_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    let uses = hint_uses();
+    let stub_module = quote! {
+        /// Describes this module for `.pyi` stubs.
+        #[doc(hidden)]
+        #[allow(unused_mut, clippy::all)]
+        pub fn __orochi_stub_module() -> ::orochi::__private::stub::Module {
+            #uses
+            let mut __orochi_module = ::orochi::__private::stub::Module::new(#short_name, #doc);
+            #(#stub_items)*
+            __orochi_module
+        }
+    };
     let mut entry = TokenStream2::new();
     if is_root {
+        // The hidden Python-side accessor of the stubs.
+        init.push(quote! {
+            ::orochi::__private::add_stubs_helper(__orochi_module, __orochi_stubs)?;
+        });
         // Inner doc comments (`//!`) become outer ones on the init function.
         let docs = item_mod
             .attrs
@@ -507,6 +581,13 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                 > = ::orochi::__private::PyOnceLock::new();
                 ::orochi::__private::module_object(&CELL, #full_name, #doc, __orochi_init)
             }
+
+            /// The `.pyi` type stubs of this module and its submodules; write
+            /// them with `orochi::write_stubs`.
+            #[doc(hidden)]
+            pub fn __orochi_stubs() -> ::orochi::Stubs {
+                ::orochi::__private::stub::stubs(__orochi_stub_module())
+            }
         };
     }
 
@@ -523,6 +604,7 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, full_name: &str, path: &[S
                     ::core::result::Result::Ok(())
                 }
             },
+            stub_module,
             entry,
         ])
         .map(Item::Verbatim)
@@ -598,6 +680,8 @@ fn new_class(
         has_ctor: false,
         names: Names::default(),
         methods: Vec::new(),
+        doc: doc_expr(attrs),
+        stub_members: Vec::new(),
     }
 }
 
@@ -642,6 +726,16 @@ fn process_struct(
                 let ty = &field.ty;
                 let docs = doc_attrs(&field.attrs);
                 let cfg = cfg_attrs(&field.attrs);
+                let doc = doc_expr(&field.attrs);
+                class.stub_members.push(quote! {
+                    #(#cfg)*
+                    __orochi_class.property(
+                        #py_name,
+                        #doc,
+                        (&&::orochi::__private::hint::Hint::<#ty>::new()).field(),
+                        (&&&::orochi::__private::hint::Hint::<#ty>::new()).setter(),
+                    );
+                });
                 let getter = format_ident!("__orochi_get_{}", ident.unraw());
                 let setter = format_ident!("__orochi_set_{}", ident.unraw());
                 let what = format!("attribute '{py_name}'");
@@ -844,8 +938,16 @@ fn process_inherent_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
                 } else {
                     Kind::Static
                 };
-                if let Some(tokens) = method_wrapper(cx, &f.sig, &f.attrs, kind, class) {
+                if let Some((tokens, stub)) = method_wrapper(cx, &f.sig, &f.attrs, kind, class) {
                     class.methods.push(quote!(#(#cfg)* #tokens));
+                    let add = match kind {
+                        Kind::Ctor => quote!(init),
+                        Kind::Static => quote!(static_method),
+                        _ => quote!(method),
+                    };
+                    class
+                        .stub_members
+                        .push(quote!(#(#cfg)* __orochi_class.#add(#stub);));
                 }
             }
             ImplItem::Const(c) if is_pub(&c.vis) => {
@@ -859,6 +961,14 @@ fn process_inherent_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
                     .chain(&cfg_attrs(&c.attrs))
                     .cloned()
                     .collect::<Vec<_>>();
+                let cty = &c.ty;
+                class.stub_members.push(quote! {
+                    #(#cfg)*
+                    __orochi_class.attribute(
+                        #py_name,
+                        (&&&::orochi::__private::hint::Hint::<#cty>::new()).output(),
+                    );
+                });
                 class.methods.push(quote_spanned! {c.ty.span()=>
                     #(#cfg)*
                     #[classattr]
@@ -898,6 +1008,7 @@ fn class_glue(class: Class, full_name: &str) -> TokenStream2 {
     let ident = &class.ident;
     let cfg = &class.cfg;
     let qualified = format!("{full_name}.{}", class.py_name);
+    let stub = class_stub(&class);
     let mut methods = class.methods;
     let extra: TokenStream2;
     if let Some(variants) = &class.variants {
@@ -939,14 +1050,32 @@ fn class_glue(class: Class, full_name: &str) -> TokenStream2 {
                 }
             }
 
+            #(#cfg)*
+            impl #ident {
+                /// The member singletons of the Python class, by variant index,
+                /// read once when the class is created.
+                #[doc(hidden)]
+                fn __orochi_members(
+                    py: ::orochi::pyo3::Python<'_>,
+                ) -> ::orochi::pyo3::PyResult<
+                    &'static [::core::option::Option<::orochi::pyo3::Py<::orochi::pyo3::PyAny>>],
+                > {
+                    static MEMBERS: ::orochi::__private::EnumMembers =
+                        ::orochi::__private::EnumMembers::new();
+                    ::orochi::__private::enum_members::<Self>(py, &MEMBERS, &[#(#names),*])
+                }
+            }
+
             /// The member singleton stored on the Python class.
             #(#cfg)*
             impl ::orochi::IntoObject for &#ident {
                 fn into_object(self) -> ::orochi::Result<::orochi::Object> {
-                    match *self {
-                        #( #(#cfgs)* #ident::#vars =>
-                            ::orochi::__private::enum_member::<#ident>(#names), )*
-                    }
+                    ::orochi::__private::enum_member(
+                        #ident::__orochi_members,
+                        match *self {
+                            #( #(#cfgs)* #ident::#vars => #index, )*
+                        },
+                    )
                 }
                 fn output_hint() -> ::std::string::String {
                     ::std::string::String::from(#qualified)
@@ -1059,6 +1188,91 @@ fn class_glue(class: Class, full_name: &str) -> TokenStream2 {
         impl #ident {
             #(#methods)*
         }
+
+        #stub
+    }
+}
+
+/// The `__orochi_stub_class()` function describing the class for `.pyi`
+/// stubs.
+fn class_stub(class: &Class) -> TokenStream2 {
+    let ident = &class.ident;
+    let cfg = &class.cfg;
+    let name = &class.py_name;
+    let doc = &class.doc;
+    // Mirrors the `__hash__ = None` class attribute generated below.
+    let unhashable = !class.is_enum() && class.eq && !class.hash;
+    let constructible = class.has_ctor;
+    let variants = class.variants.iter().flatten().map(|(v, cfgs)| {
+        let v = v.unraw().to_string();
+        quote!(#(#cfgs)* __orochi_class.variant(#v);)
+    });
+    let members = &class.stub_members;
+    let uses = hint_uses();
+    quote! {
+        #(#cfg)*
+        impl #ident {
+            #[allow(unused_mut, clippy::all)]
+            fn __orochi_stub_class() -> ::orochi::__private::stub::Class {
+                #uses
+                let mut __orochi_class =
+                    ::orochi::__private::stub::Class::new(#name, #doc, #unhashable, #constructible);
+                #(#variants)*
+                #(#members)*
+                __orochi_class
+            }
+        }
+    }
+}
+
+/// Brings the hint-selection traits into scope (anonymously, so that they
+/// cannot shadow the user's names).
+fn hint_uses() -> TokenStream2 {
+    quote! {
+        #[allow(unused_imports)]
+        use ::orochi::__private::hint::{
+            BorrowedClassHint as _, BorrowedHint as _, BorrowedHintAny as _, FieldHint as _,
+            FieldHintAny as _, InputHint as _, InputHintAny as _, MutableClassHint as _,
+            MutableHint as _, MutableHintAny as _, OutputHint as _, OutputHintAny as _,
+            OutputResultHint as _, SetterHint as _, SetterHintAny as _, SetterViewHint as _,
+        };
+    }
+}
+
+/// A `::orochi::__private::stub::Function` expression for an analyzed
+/// function or method.
+fn stub_function(a: &Analyzed, sig: &Signature, attrs: &[Attribute], kind: Kind) -> TokenStream2 {
+    let name = sig.ident.unraw().to_string();
+    let doc = doc_expr(attrs);
+    let hint = quote!(::orochi::__private::hint::Hint);
+    let params = a.params.iter().map(|p| {
+        let name = p.ident.unraw().to_string();
+        let ty = &p.ty;
+        let hint = match p.pass {
+            Pass::Value => quote!((&&#hint::<#ty>::new()).input()),
+            Pass::Ref => quote!((&&&#hint::<#ty>::new()).borrowed()),
+            Pass::OptRef => quote! {
+                ::orochi::__private::hint::optional((&&&#hint::<#ty>::new()).borrowed())
+            },
+            Pass::RefMut => quote!((&&&#hint::<#ty>::new()).mutable()),
+        };
+        let default_none = p.default_none;
+        quote!(::orochi::__private::stub::Param::new(#name, #hint, #default_none))
+    });
+    let none = quote!(::std::string::String::from("None"));
+    let ret = match (kind, a.ret, &sig.output) {
+        (Kind::Ctor, _, _) => none,
+        // The class is final, so its own name is exactly `Self`.
+        (_, Ret::SelfRef | Ret::SelfRefResult, _) => {
+            quote!(::std::string::String::from(
+                <Self as ::orochi::Class>::PYTHON_NAME
+            ))
+        }
+        (_, Ret::Convert, ReturnType::Default) => none,
+        (_, Ret::Convert, ReturnType::Type(_, ty)) => quote!((&&&#hint::<#ty>::new()).output()),
+    };
+    quote! {
+        ::orochi::__private::stub::Function::new(#name, #doc, ::std::vec![#(#params),*], #ret)
     }
 }
 
@@ -1231,12 +1445,6 @@ fn analyze(cx: &mut Cx, sig: &Signature, kind: Kind, class: Option<&Class>) -> O
                 };
                 let name = ident.unraw().to_string();
                 check_python_name(cx, &name, &ident, "parameter");
-                if name.starts_with("__orochi") {
-                    cx.error(
-                        &ident,
-                        "names starting with `__orochi` are reserved for generated code",
-                    );
-                }
                 check_type(cx, &pt.ty, "parameter");
                 let (ty, pass) = match &*pt.ty {
                     Type::Reference(r) => {
@@ -1422,8 +1630,14 @@ fn generic_arg<'a>(ty: &'a Type, name: &str) -> Option<&'a Type> {
     }
 }
 
-fn function_wrapper(cx: &mut Cx, f: &ItemFn, wrapper: &Ident) -> Option<TokenStream2> {
+/// The `#[pyfunction]` wrapper of `f`, and its stub description.
+fn function_wrapper(
+    cx: &mut Cx,
+    f: &ItemFn,
+    wrapper: &Ident,
+) -> Option<(TokenStream2, TokenStream2)> {
     let a = analyze(cx, &f.sig, Kind::Function, None)?;
+    let stub = stub_function(&a, &f.sig, &f.attrs, Kind::Function);
     let ident = &f.sig.ident;
     let py_name = ident.unraw().to_string();
     let docs = doc_attrs(&f.attrs);
@@ -1441,7 +1655,7 @@ fn function_wrapper(cx: &mut Cx, f: &ItemFn, wrapper: &Ident) -> Option<TokenStr
         &py_name,
         false,
     );
-    Some(quote! {
+    let tokens = quote! {
         #(#cfg)*
         #[::orochi::pyo3::pyfunction(crate = #PY, name = #py_name, signature = (#(#signature),*), text_signature = #text_sig)]
         #(#docs)*
@@ -1449,7 +1663,8 @@ fn function_wrapper(cx: &mut Cx, f: &ItemFn, wrapper: &Ident) -> Option<TokenStr
         fn #wrapper(#(#wrapper_args),*) -> ::orochi::__private::PyResultObject {
             #body
         }
-    })
+    };
+    Some((tokens, stub))
 }
 
 fn method_wrapper(
@@ -1458,8 +1673,9 @@ fn method_wrapper(
     attrs: &[Attribute],
     kind: Kind,
     class: &Class,
-) -> Option<TokenStream2> {
+) -> Option<(TokenStream2, TokenStream2)> {
     let a = analyze(cx, sig, kind, Some(class))?;
+    let stub = stub_function(&a, sig, attrs, kind);
     let ident = &sig.ident;
     let py_name = ident.unraw().to_string();
     let what = format!("{}.{py_name}()", class.py_name);
@@ -1476,7 +1692,7 @@ fn method_wrapper(
         &what,
         class.is_enum(),
     );
-    Some(match kind {
+    let tokens = match kind {
         Kind::Ctor => quote! {
             #[new]
             #[pyo3(signature = (#(#signature),*), text_signature = #text_sig)]
@@ -1508,7 +1724,8 @@ fn method_wrapper(
                 }
             }
         }
-    })
+    };
+    Some((tokens, stub))
 }
 
 /// Per-parameter pieces of a wrapper.
@@ -1797,4 +2014,63 @@ fn doc_expr(attrs: &[Attribute]) -> TokenStream2 {
         }
     }
     quote!(::core::concat!(#(#parts),*))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The error messages `#[orochi::module]` reports for `input`.
+    fn errors(args: TokenStream2, input: TokenStream2) -> Vec<String> {
+        match expand(args, input) {
+            Ok(_) => Vec::new(),
+            Err(err) => err.into_iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn orochi_names_are_reserved() {
+        let cases = [
+            (quote!(), quote!(mod m { pub fn _orochi_stubs() {} }), "_orochi_stubs"),
+            (quote!(), quote!(mod m { pub fn __orochi_init() {} }), "__orochi_init"),
+            (quote!(), quote!(mod m { pub const _orochi: i64 = 1; }), "_orochi"),
+            (quote!(), quote!(mod m { pub static __orochi_x: i64 = 1; }), "__orochi_x"),
+            (quote!(), quote!(mod m { pub struct _orochiThing; }), "_orochiThing"),
+            (quote!(), quote!(mod m { pub enum E { _orochi_member } }), "_orochi_member"),
+            (quote!(), quote!(mod m { pub mod _orochi_sub {} }), "_orochi_sub"),
+            (quote!(), quote!(mod _orochi_mod {}), "_orochi_mod"),
+            (quote!(name = "_orochi_lib"), quote!(mod m {}), "_orochi_lib"),
+            (quote!(), quote!(mod m { pub fn f(_orochi_x: i64) {} }), "_orochi_x"),
+            (quote!(), quote!(mod m { pub fn f(__orochi_y: i64) {} }), "__orochi_y"),
+            (
+                quote!(),
+                quote!(mod m { pub struct S { pub _orochi_field: i64 } }),
+                "_orochi_field",
+            ),
+            (
+                quote!(),
+                quote!(mod m { pub struct S; impl S { pub fn _orochi_m(&self) {} } }),
+                "_orochi_m",
+            ),
+            (
+                quote!(),
+                quote!(mod m { pub struct S; impl S { pub const _orochi_C: i64 = 1; } }),
+                "_orochi_C",
+            ),
+        ];
+        for (args, input, name) in cases {
+            let errors = errors(args, input);
+            let expected = format!(
+                "`{name}` cannot be the name of an exported"
+            );
+            assert!(
+                errors.len() == 1 && errors[0].starts_with(&expected),
+                "{name}: {errors:?}"
+            );
+            assert!(errors[0].contains("reserved for orochi"), "{errors:?}");
+        }
+        // Only the prefix is reserved.
+        assert!(errors(quote!(), quote!(mod m { pub fn orochi_stubs() {} pub fn _orochi2() {} })).len() == 1);
+        assert!(errors(quote!(), quote!(mod m { pub fn orochi_stubs() {} pub fn x_orochi() {} })).is_empty());
+    }
 }

@@ -450,11 +450,143 @@ pub mod mylib {
         }
     }
 
+    /// Field types whose views are decided by the Rust type, not by what
+    /// the value looks like in Python.
+    pub struct Shelf {
+        /// A handle: the referenced list itself.
+        pub handle: List<i64>,
+        /// Any object: returned as it is, even a list.
+        pub any: Object,
+        /// A fixed-size array: a plain list, whose `Vec` elements are views.
+        pub grid: [Vec<i64>; 2],
+        /// Elements that are arrays: plain lists.
+        pub pairs: Vec<[i64; 2]>,
+        pub boxed: Option<Box<Vec<i64>>>,
+    }
+
+    impl Shelf {
+        pub fn new(handle: List<i64>) -> Self {
+            Shelf {
+                handle,
+                any: Object::none(),
+                grid: [Vec::new(), Vec::new()],
+                pairs: Vec::new(),
+                boxed: None,
+            }
+        }
+    }
+
+    /// Returns its argument.
+    pub fn identity(x: Object) -> Object {
+        x
+    }
+
+    pub fn objects(xs: Vec<Object>) -> Vec<Object> {
+        xs
+    }
+
+    /// `&mut` of an instance and of something inside it.
+    pub fn refill(bag: &mut Bag, xs: &mut Vec<i64>) {
+        bag.items.clear();
+        xs.push(1);
+    }
+
+    #[allow(clippy::ptr_arg)]
+    pub fn nest(rows: &mut Vec<Vec<i64>>, row: &mut Vec<i64>) {
+        rows.push(row.clone());
+    }
+
+    /// `&mut` containers are typed with the elements' output hints.
+    pub fn touch_nested(
+        table: &mut HashMap<String, Vec<i64>>,
+        blobs: &mut Vec<Vec<u8>>,
+        paths: &mut Vec<PathBuf>,
+    ) {
+        let _ = (table, blobs, paths);
+    }
+
+    /// Only used by the enum-member cache test.
+    pub enum Mood {
+        Calm,
+    }
+
+    pub fn calm() -> Mood {
+        Mood::Calm
+    }
+
+    /// Member names that shadow builtins and modules used by stub hints.
+    #[derive(Default)]
+    pub struct Shadow {
+        pub str: String,
+        pub typing: Option<Object>,
+    }
+
+    impl Shadow {
+        pub fn new() -> Self {
+            Shadow::default()
+        }
+
+        pub fn int(&self) -> i64 {
+            0
+        }
+
+        pub fn list(&self, items: Vec<String>) -> Vec<String> {
+            items
+        }
+    }
+
+    /// A class of a submodule.
+    pub fn unit_square() -> geometry::Square {
+        geometry::Square::new(1.0)
+    }
+
     pub mod geometry {
         #![doc = concat!("Geometry ", "helpers.")]
 
         /// Not the root module's class `Point`.
         type Point = (f64, f64);
+
+        /// A class of the parent module.
+        pub fn centroid(points: &[super::Point]) -> super::Point {
+            let n = points.len().max(1) as f64;
+            let x = points.iter().map(|p| p.x).sum::<f64>() / n;
+            let y = points.iter().map(|p| p.y).sum::<f64>() / n;
+            super::Point::new(x, y)
+        }
+
+        pub mod solids {
+            //! Nested submodule.
+            use orochi::prelude::*;
+
+            /// Same name as `geometry.Square`.
+            pub struct Square {
+                pub side: f64,
+            }
+
+            pub struct Cube {
+                pub base: Ref<super::Square>,
+            }
+
+            impl Cube {
+                pub fn new(base: Ref<super::Square>) -> Self {
+                    Cube { base }
+                }
+
+                pub fn face(&self) -> Result<Square> {
+                    Ok(Square {
+                        side: self.base.borrow()?.side,
+                    })
+                }
+
+                pub fn shade(&self) -> super::super::Shade {
+                    super::super::Shade::Dark
+                }
+
+                pub fn corner(&self, at: Option<&super::super::Point>) -> super::super::Point {
+                    at.cloned().unwrap_or_else(super::super::Point::origin)
+                }
+            }
+        }
 
         pub struct Segment {
             pub a: Point,

@@ -203,3 +203,18 @@ fn enums() {
         assert len({C.Red, C.Red, C.Green}) == 2
     "#);
 }
+
+#[test]
+fn enum_members_are_cached_at_class_creation() {
+    // Conversions return the member objects read when the class was
+    // created, even if the class attribute is reassigned later.
+    run(r#"
+        calm = mylib.Mood.Calm
+        assert mylib.calm() is calm
+        mylib.Mood.Calm = "replaced"
+        try:
+            assert mylib.calm() is calm
+        finally:
+            mylib.Mood.Calm = calm
+    "#);
+}

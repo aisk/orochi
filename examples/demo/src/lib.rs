@@ -69,6 +69,7 @@ mod demo {
     #[derive(Default)]
     pub struct Basket {
         pub items: Vec<String>,
+        pub numbers: Vec<i64>,
         pub table: HashMap<String, Vec<i64>>,
     }
 
@@ -78,7 +79,7 @@ mod demo {
         }
 
         pub fn count(&self) -> usize {
-            self.items.len() + self.table.values().map(Vec::len).sum::<usize>()
+            self.items.len() + self.numbers.len() + self.table.values().map(Vec::len).sum::<usize>()
         }
     }
 

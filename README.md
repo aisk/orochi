@@ -186,26 +186,53 @@ b.items.append("apple")          # changes the Rust `Vec`
 b.table.setdefault("k", []).append(1)   # nested containers are live too
 b.items.append(1)                # TypeError at once; the field is unchanged
 b.items = ["pear"]               # assigning the whole field works as usual
-plain = list(b.items)            # a real list, e.g. for json.dumps
+json.dumps(b.table.copy())       # copy() gives plain builtins all the way down
 ```
 
-A view supports what the builtin does (indexing and slices, `len`, `in`,
-`==`, `repr`, the usual methods and operators) and is accepted wherever the
-container is (`mylib.push_twice(b.items, 7)` updates the struct), but it is
-not a `list`/`dict`/`set` instance: `list(view)`, `dict(view)`, `set(view)` or
-`view.copy()` give a builtin copy (`copy()` also turns nested views into plain
-containers). Each operation copies the field out and, if it changes it, back
-in, so it is slow for large containers. A nested view addresses its position
+A view supports what the builtin does (indexing, `len`, `in`, `==`, `repr`,
+the usual methods and operators) and is accepted where the container is
+converted or borrowed (`mylib.push_twice(b.items, 7)` updates the struct; a
+view passed or assigned by value is converted from its current contents). It
+is not a `list`/`dict`/`set` instance: `view.copy()` gives a builtin copy with
+nested views turned into plain containers, while `list(view)`, `dict(view)`
+and `set(view)` copy only the outer level. A slice is a `list` of the
+elements, which are views themselves when the elements are containers.
+Iteration runs over a snapshot taken when it starts. Operators with types the
+view does not know return `NotImplemented`, as the builtins do.
+
+Some differences from the builtins follow from the Rust types: a
+`HashMap`/`HashSet` view has Rust's arbitrary order, which can change after
+any modification (use `BTreeMap`/`BTreeSet` for sorted order), and
+`popitem()` removes an arbitrary item rather than the last inserted one. A
+view is not a handle: passing one where a `List<T>` / `Dict<K, V>` / `Set<T>`
+is expected raises `TypeError` (take `&mut Vec<T>` instead, or pass
+`list(view)`).
+
+Each operation copies the field out and, if it changes it, back in, so it is
+slow for large containers. Operations on views are atomic with respect to each
+other (one lock for all views), so threads appending to the same view lose no
+items; a plain field assignment or a Rust method that changes the field at the
+same time is not covered by that lock and can be overwritten by a view
+operation in progress, or overwrite it. A nested view addresses its position
 (index or key) in its parent, so after the parent is restructured it follows
-whatever is now at that position. Other fields (numbers, strings, tuples,
-`PathBuf`, fixed-size arrays, ...) are plain copies: `b.label += "x"` works,
-but mutating a copy, e.g. of an array field, does not change the struct.
+whatever is now at that position.
+
+Whether a field is a view depends on its Rust type, not its current value:
+handles (`List<T>`, `Object`, ...) and `Ref<T>` are the Python objects
+themselves, and other fields (numbers, strings, tuples, `PathBuf`, ...) are
+plain copies: `b.label += "x"` works, but mutating a copy does not change the
+struct. A fixed-size array reads as a plain `list` whose container elements
+are views (`s.grid[0].append(1)` changes the struct, `s.grid.append(...)` does
+not).
 
 A fieldless `pub enum` is a class whose members are attributes: they are
 singletons (`mylib.favorite() is mylib.Color.Red`), compare and hash by
 member whatever the enum derives, and only members are accepted as arguments.
 The class is not iterable or callable (`list(Color)` and `Color(1)` raise
-`TypeError`).
+`TypeError`). Rust returns the member objects that existed when the class was
+created, even if `Color.Red` is later reassigned in Python; the stubs mark
+members `Final`, so type checkers reject such an assignment, but the runtime
+does not.
 
 **Sharing Python objects.** For a value that must outlive the call or keep
 its identity, use the handle types: `Object`, `List<T>`, `Dict<K, V>`,
@@ -217,8 +244,9 @@ a class held by value inside a container (`pub points: Vec<Point>`; use
 
 Unsupported items (generic or `async` functions, `impl Trait` parameters,
 explicit lifetimes, enums with data, `pub use`, `pub trait`, Python keywords
-such as `r#in` as names, ...) are compile errors when `pub`; make them private
-to keep them Rust-only. Items produced by a `macro_rules!` macro inside the
+such as `r#in` as names, names starting with `_orochi` or `__orochi`, which
+orochi reserves, ...) are compile errors when `pub`; make them private to keep
+them Rust-only. Items produced by a `macro_rules!` macro inside the
 module are not exported: the attribute only sees the macro call, not the
 items it expands to.
 
@@ -238,6 +266,75 @@ hand: `cargo build`, then copy the library to a directory on Python's path as
 `PYO3_BUILD_EXTENSION_MODULE=1` when building, as maturin does). The file name
 must match the module name. `examples/demo` is a complete example; on Windows
 `examples\demo\run.ps1` builds it and imports it with Python.
+
+## Type stubs
+
+Every `#[orochi::module]` can write `.pyi` stubs for itself, so that editors
+and type checkers understand it like a typed Python library. With the built
+module:
+
+```sh
+python -c "import mylib; mylib._orochi_stubs('typings')"
+```
+
+This writes `typings/mylib.pyi`, or a stub package (`typings/mylib/__init__.pyi`,
+`typings/mylib/geometry.pyi`, ...) when the module has submodules, and removes
+the stubs of the other layout that orochi generated earlier (files it did not
+write are kept); `mylib._orochi_stubs()` without a directory only returns
+`{relative path: text}`. Pyright and Pylance read `typings/` by default; for
+mypy set `mypy_path = typings`. `_orochi_stubs` itself is hidden: it is not in
+`__all__` nor in the stubs.
+
+To ship the stubs with the module (PEP 561), either:
+
+- with maturin and a module without submodules, put `mylib.pyi` beside
+  `Cargo.toml`: maturin packages it as `mylib/__init__.pyi` with a `py.typed`
+  marker. Stubs of submodules are not picked up this way.
+- publish a separate stub-only package whose files are the stub package in a
+  directory named `mylib-stubs/` (`mylib-stubs/__init__.pyi`,
+  `mylib-stubs/geometry.pyi`, ...); type checkers prefer it to the module.
+
+Both were checked with mypy 2.4.1 and pyright 1.1.407 against
+`examples/demo` installed from a wheel built by `maturin build` (maturin
+1.9.6), with `mylib-stubs/` copied into the environment's `site-packages`;
+building and publishing the stub-only distribution itself was not tested.
+
+The same from Rust, e.g. in a test of the extension crate (no interpreter is
+started, although the test binary links Python like any other):
+
+```rust,no_run
+#[orochi::module]
+mod mylib {
+    pub fn add(a: i64, b: Option<i64>) -> i64 {
+        a + b.unwrap_or(1)
+    }
+}
+
+#[test]
+fn write_stubs() {
+    orochi::write_stubs(&mylib::__orochi_stubs(), "typings").unwrap();
+}
+```
+
+Stubs include docstrings, parameter names and `None` defaults, and the
+types the conversions really accept and return: `Vec<T>` parameters take any
+`collections.abc.Sequence[T]`, but `&mut Vec<T>` needs a `list[T]` or a view
+(only those can be written back); `Result<T, E>` returns `T` and `&mut Self`
+the class. Container fields are properties typed with view classes that exist
+only for type checkers (`ListView`, `DictView`, `SetView`, defined in the root
+stub with `@typing.type_check_only`): `b.items.append("x")`,
+`b.items += [...]`, `mylib.push_twice(b.items, 7)` and `b.table =
+other.table` type-check, and `b.items.copy()` is a plain `list`. Classes are
+`@typing.final` with `__new__` from `new` (a class without `new`, and an enum,
+gets a `__new__` that no call matches); enum members are `Final` attributes
+of their class.
+
+Stubs are looser than the runtime in places: an integer or string type only
+says `int` / `str` (not the range of a `u8`, say), a by-value `dict`/`set`
+parameter is typed with the builtin although a view is accepted too, and a
+custom conversion is only as precise as its hint. A custom `FromObject` / `IntoObject` hint is used as written:
+spell names fully qualified (`typing.Any`, `numpy.typing.NDArray[numpy.float64]`)
+and the stub imports their modules.
 
 ## Embedding Python
 
@@ -303,6 +400,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 .\examples\demo\run.ps1   # builds the demo extension and imports it with Python
                           # (`py -3` or `python`; or pass -Python <python.exe>)
+.\examples\demo\run.ps1 -TypeCheck   # also checks its stubs with mypy (needs uv):
+                                     # stubtest, typecheck/good.py, typecheck/bad.py
 ```
 
 `PYO3_PYTHON` can be set to select the interpreter used at build time.

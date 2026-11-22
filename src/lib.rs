@@ -110,6 +110,7 @@ mod object;
 #[path = "private.rs"]
 pub mod __private;
 mod runtime;
+mod stubs;
 
 pub use args::{Args, IntoArgs, IntoKwargs, Kwargs};
 #[doc(hidden)]
@@ -120,6 +121,7 @@ pub use error::{Error, Result};
 pub use eval::{Scope, builtins, eval, exec, import};
 pub use handles::{Dict, List, Set};
 pub use object::{Iter, Object};
+pub use stubs::{Stubs, write_stubs};
 
 #[doc(hidden)]
 pub use pyo3;
@@ -277,6 +279,15 @@ pub use pyo3;
 /// read as a copy, so `c.center.x = 5` would do nothing); use [`Ref<T>`] to
 /// share one instance. See [`Ref`].
 ///
+/// # Type stubs
+///
+/// The attribute also describes the module for `.pyi` stubs: write them from
+/// Rust with `orochi::write_stubs(&mylib::__orochi_stubs(), dir)` (see
+/// [`Stubs`]), or from Python with `mylib._orochi_stubs(dir)`, a hidden
+/// function of the root module that returns `{relative path: text}` and,
+/// given a directory, writes the files there (replacing stubs of the other
+/// layout, single file or package, that orochi generated before).
+///
 /// # Not supported
 ///
 /// These are compile errors on `pub` items (make the item private to keep it
@@ -285,7 +296,8 @@ pub use pyo3;
 /// that are patterns, special methods written by hand (`__len__`, ...),
 /// tuple structs with `pub` fields, enums with data, `pub use`, `pub trait`,
 /// `pub type`, `pub static mut`, non-inline `pub mod`, Python keywords as
-/// names (`r#in`; `r#type` is fine), `#[cfg]` on parameters or on the
+/// names (`r#in`; `r#type` is fine), names starting with `_orochi` or
+/// `__orochi` (reserved for orochi), `#[cfg]` on parameters or on the
 /// `Debug`/`Display`/`PartialEq`/`Hash`/`Clone` impls of a class. Items
 /// produced by `macro_rules!` macros inside the module are not exported (the
 /// attribute only sees the macro call).
