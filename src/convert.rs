@@ -275,7 +275,13 @@ fn is_int_like(obj: &Bound<'_, PyAny>) -> bool {
 /// Python's `operator.index(obj)`: the exact `int` value of an integer-like
 /// object.
 fn as_exact_int<'py>(obj: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>> {
-    Ok(obj.py().import("operator")?.getattr("index")?.call1((obj,))?)
+    // The common case needs no call at all.
+    if obj.is_exact_instance_of::<pyo3::types::PyInt>() {
+        return Ok(obj.clone());
+    }
+    static INDEX: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let index = INDEX.import(obj.py(), "operator", "index")?;
+    Ok(index.call1((obj,))?)
 }
 
 /// Extracts an integer of type `T`, raising `OverflowError` (never
