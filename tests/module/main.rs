@@ -2,12 +2,12 @@
 //! macro, built in-process with `__orochi_module()`, and driven from Python
 //! code through the embedded interpreter.
 
+mod builder;
 mod classes;
 mod fields;
 mod functions;
 mod mylib_def;
 mod semantics;
-mod stubs;
 
 use orochi::Scope;
 

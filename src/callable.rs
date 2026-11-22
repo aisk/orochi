@@ -20,12 +20,6 @@ pub trait IntoPyFunction<Marker>: Send + Sync + 'static {
 
     /// Calls the closure; `args.len()` equals `ARITY`.
     fn invoke(&self, args: &[Object]) -> Result<Object>;
-
-    /// Type hints of the parameters.
-    fn param_hints() -> Vec<String>;
-
-    /// Type hint of the return value.
-    fn return_hint() -> String;
 }
 
 macro_rules! fn_impls {
@@ -41,14 +35,6 @@ macro_rules! fn_impls {
             #[allow(unused_variables)]
             fn invoke(&self, args: &[Object]) -> Result<Object> {
                 (self)($(convert_arg::<$arg>(args, $idx)?),*).into_object()
-            }
-
-            fn param_hints() -> Vec<String> {
-                vec![$($arg::input_hint()),*]
-            }
-
-            fn return_hint() -> String {
-                R::output_hint()
             }
         }
     };

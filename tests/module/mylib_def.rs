@@ -4,10 +4,12 @@
 pub mod mylib {
     #![doc = concat!("A test ", "library.")]
     use orochi::prelude::*;
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     pub const VERSION: &str = "1.2.3";
+    pub static LIMIT: i64 = 10;
+
 
     /// Add two integers.
     pub fn add(a: i64, b: Option<i64>) -> i64 {
@@ -38,9 +40,11 @@ pub mod mylib {
         format!("hello {}", name.unwrap_or("world"))
     }
 
-    pub fn first_word(text: &str) -> &str {
-        text.split_whitespace().next().unwrap_or("")
+    pub fn first_word(text: &str) -> String {
+        text.split_whitespace().next().unwrap_or("").to_owned()
     }
+
+    pub fn nothing() {}
 
     /// The handle type: refers to the caller's list itself.
     pub fn push_handle(xs: List<i64>, v: i64) -> Result<()> {
@@ -56,8 +60,8 @@ pub mod mylib {
         rows.iter().flat_map(|row| row.values()).flatten().sum()
     }
 
-    pub fn nested_len(rows: &[HashMap<String, Vec<i64>>]) -> usize {
-        rows.iter().map(HashMap::len).sum()
+    pub fn many(a: i64, b: i64, c: i64, d: Option<i64>) -> i64 {
+        a * 1000 + b * 100 + c * 10 + d.unwrap_or(0)
     }
 
     #[allow(private_interfaces)]
@@ -80,10 +84,11 @@ pub mod mylib {
         slf: i64,
         args: i64,
         kwargs: i64,
-        module: i64,
+        m: i64,
+        c: i64,
         r#type: i64,
     ) -> i64 {
-        py + slf + args + kwargs + module + r#type
+        py + slf + args + kwargs + m + c + r#type
     }
 
     /// A leading underscore must not trigger `non_snake_case` in generated code.
@@ -98,13 +103,13 @@ pub mod mylib {
         7
     }
 
-    /// An error type that only implements `Display`.
+    /// An error type converted into a Python exception by its `From` impl.
     #[derive(Debug)]
     pub(crate) struct MyError(String);
 
-    impl std::fmt::Display for MyError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "my error: {}", self.0)
+    impl From<MyError> for Error {
+        fn from(e: MyError) -> Error {
+            Error::new("LookupError", format!("my error: {}", e.0))
         }
     }
 
@@ -119,8 +124,10 @@ pub mod mylib {
 
     impl Point {
         pub const DIMENSIONS: usize = 2;
+        /// A class attribute that is an instance.
+        pub const UNIT: Point = Point { x: 1.0, y: 0.0, cache: None };
 
-        /// Creates a point.
+        /// Creates a point from its coordinates.
         pub fn new(x: f64, y: f64) -> Self {
             Point { x, y, cache: None }
         }
@@ -130,27 +137,22 @@ pub mod mylib {
             (self.x * self.x + self.y * self.y).sqrt()
         }
 
-        pub fn scale(&mut self, k: f64) -> &mut Self {
+        pub fn scale(&mut self, k: f64) {
             self.x *= k;
             self.y *= k;
             self.cache = None;
-            self
         }
 
-        pub fn checked_scale(&mut self, k: f64) -> Result<&mut Self> {
+        pub fn checked_scale(&mut self, k: f64) -> Result<()> {
             if k == 0.0 {
                 return Err(Error::value_error("k must not be zero"));
             }
-            Ok(self.scale(k))
+            self.scale(k);
+            Ok(())
         }
 
         pub fn origin() -> Self {
             Point::new(0.0, 0.0)
-        }
-
-        /// A reference to another instance: returned as a copy.
-        pub fn origin_ref(&self) -> &'static Point {
-            &ORIGIN
         }
 
         pub fn dist(&self, other: &Point) -> f64 {
@@ -164,11 +166,12 @@ pub mod mylib {
         }
 
         /// Adds `other` into `self` (conflicts when `other is self`).
-        pub fn absorb(&mut self, other: &Point) {
+        pub fn absorb(&mut self, other: &Self) {
             self.x += other.x;
             self.y += other.y;
         }
 
+        /// By value: a copy of the instance.
         pub fn swapped(self) -> Point {
             Point::new(self.y, self.x)
         }
@@ -179,6 +182,17 @@ pub mod mylib {
                 .get_or_insert_with(|| (self.x * self.x + self.y * self.y).sqrt())
         }
 
+        pub fn nearest(&self, others: Vec<Ref<Point>>) -> Result<Option<Ref<Point>>> {
+            let mut best: Option<(f64, Ref<Point>)> = None;
+            for p in others {
+                let d = self.dist(&*p.borrow()?);
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, p));
+                }
+            }
+            Ok(best.map(|(_, p)| p))
+        }
+
         #[allow(dead_code)]
         fn internal(&self) {}
     }
@@ -187,6 +201,33 @@ pub mod mylib {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "({}, {})", self.x, self.y)
         }
+    }
+
+    /// By value: a copy.
+    pub fn mirrored(mut p: Point) -> Point {
+        p.x = -p.x;
+        p
+    }
+
+    pub fn x_or_zero(p: Option<&Point>) -> f64 {
+        p.map_or(0.0, |p| p.x)
+    }
+
+    /// `Ref<T>` in and out: the same instance.
+    pub fn same(p: Ref<Point>) -> Ref<Point> {
+        p
+    }
+
+    pub fn maybe_point(give: bool) -> Option<Point> {
+        give.then(Point::origin)
+    }
+
+    pub fn parse_point(text: &str) -> Result<Point> {
+        let (x, y) = text
+            .split_once(',')
+            .ok_or_else(|| Error::value_error(format!("not a point: {text:?}")))?;
+        let num = |s: &str| s.trim().parse::<f64>().map_err(|e| Error::value_error(e.to_string()));
+        Ok(Point::new(num(x)?, num(y)?))
     }
 
     /// Hashable, with fallible constructor.
@@ -229,6 +270,15 @@ pub mod mylib {
         c.count
     }
 
+    /// No constructor: instances only come from Rust.
+    pub struct Token {
+        pub id: i64,
+    }
+
+    pub fn token(id: i64) -> Token {
+        Token { id }
+    }
+
     pub struct Circle {
         pub center: Ref<Point>,
         pub radius: f64,
@@ -244,70 +294,14 @@ pub mod mylib {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum Color {
-        Red,
-        Green,
-    }
-
-    pub fn is_red(c: Color) -> bool {
-        c == Color::Red
-    }
-
-    pub fn favorite() -> Color {
-        Color::Red
-    }
-
-    /// No derives at all: members still compare and hash, and convert.
-    pub enum Shade {
-        Light,
-        Dark,
-    }
-
-    impl Shade {
-        pub fn inverted(self) -> Shade {
-            match self {
-                Shade::Light => Shade::Dark,
-                Shade::Dark => Shade::Light,
-            }
-        }
-
-        pub fn is_dark(&self) -> bool {
-            matches!(self, Shade::Dark)
-        }
-    }
-
-    pub fn darkest(shades: Vec<Shade>) -> Option<Shade> {
-        shades.into_iter().find(|s| s.is_dark())
-    }
-
-    /// Not `Clone`; methods return references to itself or to a static.
+    /// Methods in `#[cfg]`-gated impl blocks.
     pub struct Node {
         pub id: i64,
     }
 
-    static SHARED_NODE: Node = Node { id: -1 };
-    static ORIGIN: Point = Point {
-        x: 0.0,
-        y: 0.0,
-        cache: None,
-    };
-
     impl Node {
         pub fn new(id: i64) -> Self {
             Node { id }
-        }
-
-        pub fn me(&self) -> &Node {
-            self
-        }
-
-        pub fn shared(&self) -> &'static Node {
-            &SHARED_NODE
-        }
-
-        pub fn pick(&mut self, own: bool) -> Result<&Self> {
-            Ok(if own { self } else { &SHARED_NODE })
         }
     }
 
@@ -364,40 +358,31 @@ pub mod mylib {
         x
     }
 
+    /// An anonymous lifetime is fine in a parameter.
+    pub fn cow_len(s: std::borrow::Cow<'_, str>) -> usize {
+        s.len()
+    }
+
+    pub fn identity2(x: Object) -> Object {
+        x
+    }
+
     pub fn objects(xs: Vec<Object>) -> Vec<Object> {
         xs
     }
 
-    /// Fields of Rust value types read as immutable snapshots.
+    /// Simple value fields, and a value container kept private.
     #[derive(Default)]
     pub struct Bag {
-        pub items: Vec<i64>,
-        pub rows: Vec<Vec<i64>>,
-        pub table: HashMap<String, Vec<i64>>,
-        pub counts: BTreeMap<String, i64>,
-        pub tags: BTreeSet<String>,
-        pub sets: HashSet<(i64, i64)>,
-        pub maybe: Option<Vec<i64>>,
-        pub boxed: Option<Box<Vec<i64>>>,
-        pub fixed: [i64; 2],
-        pub pair: (i64, Vec<i64>),
-        pub data: Vec<u8>,
         pub label: String,
         pub path: PathBuf,
-        /// References inside a value container stay references.
-        pub handles: Vec<List<i64>>,
-        pub objects: Vec<Object>,
-        pub points: Vec<Ref<Point>>,
-        pub refs: HashMap<String, Ref<Point>>,
-        pub maybe_list: Option<List<i64>>,
-        pub dicts: Vec<HashMap<String, i64>>,
-        pub opts: Vec<Option<i64>>,
-        pub blobs: Vec<Vec<u8>>,
-        pub by_path: HashMap<PathBuf, i64>,
-        /// Enum members are immutable singletons, so held by value.
-        pub color: Option<Color>,
-        pub colors: Vec<Color>,
-        pub palette: HashMap<String, Color>,
+        pub letter: char,
+        pub flag: bool,
+        pub ratio: f32,
+        pub small: u8,
+        pub maybe: Option<i64>,
+        pub note: Option<String>,
+        items: Vec<i64>,
     }
 
     impl Bag {
@@ -405,15 +390,12 @@ pub mod mylib {
             Bag::default()
         }
 
-        pub fn total(&self) -> i64 {
-            self.items.iter().sum()
+        pub fn items(&self) -> Vec<i64> {
+            self.items.clone()
         }
 
         pub fn push(&mut self, v: i64) {
             self.items.push(v);
-            self.rows.push(vec![v]);
-            self.table.entry(v.to_string()).or_default().push(v);
-            self.tags.insert(v.to_string());
         }
     }
 
@@ -423,6 +405,7 @@ pub mod mylib {
         pub map: Dict<String, i64>,
         pub members: Set<i64>,
         pub any: Object,
+        pub maybe_list: Option<List<i64>>,
     }
 
     impl Shelf {
@@ -432,6 +415,7 @@ pub mod mylib {
                 map: Dict::new(),
                 members: Set::new(),
                 any: Object::none(),
+                maybe_list: None,
             }
         }
 
@@ -440,16 +424,7 @@ pub mod mylib {
         }
     }
 
-    /// Only used by the enum-member cache test.
-    pub enum Mood {
-        Calm,
-    }
-
-    pub fn calm() -> Mood {
-        Mood::Calm
-    }
-
-    /// Member names that shadow builtins and modules used by stub hints.
+    /// Member names that shadow builtins.
     #[derive(Default)]
     pub struct Shadow {
         pub str: String,
@@ -477,16 +452,21 @@ pub mod mylib {
 
     pub mod geometry {
         #![doc = concat!("Geometry ", "helpers.")]
+        use orochi::prelude::*;
 
         /// Not the root module's class `Point`.
         type Point = (f64, f64);
 
-        /// A class of the parent module.
-        pub fn centroid(points: &[super::Point]) -> super::Point {
+        /// Instances of the parent module's class.
+        pub fn centroid(points: Vec<Ref<super::Point>>) -> Result<super::Point> {
             let n = points.len().max(1) as f64;
-            let x = points.iter().map(|p| p.x).sum::<f64>() / n;
-            let y = points.iter().map(|p| p.y).sum::<f64>() / n;
-            super::Point::new(x, y)
+            let (mut x, mut y) = (0.0, 0.0);
+            for p in &points {
+                let p = p.borrow()?;
+                x += p.x;
+                y += p.y;
+            }
+            Ok(super::Point::new(x / n, y / n))
         }
 
         pub mod solids {
@@ -513,10 +493,6 @@ pub mod mylib {
                     })
                 }
 
-                pub fn shade(&self) -> super::super::Shade {
-                    super::super::Shade::Dark
-                }
-
                 pub fn corner(&self, at: Option<&super::super::Point>) -> super::super::Point {
                     at.cloned().unwrap_or_else(super::super::Point::origin)
                 }
@@ -524,15 +500,20 @@ pub mod mylib {
         }
 
         pub struct Segment {
-            pub a: Point,
-            pub b: Point,
+            a: Point,
+            b: Point,
         }
 
         impl Segment {
             pub fn new(a: Point, b: Point) -> Self {
                 Segment { a, b }
             }
+
+            pub fn ends(&self) -> (Point, Point) {
+                (self.a, self.b)
+            }
         }
+
 
         /// Area of a circle.
         pub fn area(r: f64) -> f64 {
@@ -546,6 +527,43 @@ pub mod mylib {
         impl Square {
             pub fn new(side: f64) -> Self {
                 Square { side }
+            }
+        }
+    }
+
+    /// Items named like bindings the generated code could use.
+    #[allow(non_upper_case_globals, non_camel_case_types)]
+    pub mod hygiene {
+        pub static m: i64 = 1;
+        pub const c: i64 = 2;
+
+        pub struct P {
+            pub x: i64,
+        }
+
+        impl P {
+            pub fn new(x: i64) -> Self {
+                P { x }
+            }
+
+            pub fn get(&self) -> i64 {
+                self.x + m + c
+            }
+        }
+
+        pub mod inner {
+            pub struct m;
+
+            pub struct c {
+                pub v: i64,
+            }
+
+            pub fn make_m() -> m {
+                m
+            }
+
+            pub fn make_c() -> c {
+                c { v: 1 }
             }
         }
     }

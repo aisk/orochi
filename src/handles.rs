@@ -20,7 +20,7 @@ use crate::object::Object;
 use crate::runtime::attach;
 
 macro_rules! handle_common {
-    ($name:ident <$($p:ident),+>, $pytype:ty, $pyname:literal, in: $in_hint:expr, out: $out_hint:expr) => {
+    ($name:ident <$($p:ident),+>, $pytype:ty, $pyname:literal) => {
         impl<$($p),+> $name<$($p),+> {
             /// The handle as an untyped [`Object`] (same Python object).
             pub fn as_object(&self) -> &Object {
@@ -73,18 +73,12 @@ macro_rules! handle_common {
             fn into_object(self) -> Result<Object> {
                 Ok(self.obj)
             }
-            fn output_hint() -> String {
-                $out_hint
-            }
         }
 
         /// Passes the referenced object itself (no copy).
         impl<$($p: IntoObject),+> IntoObject for &$name<$($p),+> {
             fn into_object(self) -> Result<Object> {
                 Ok(self.obj.clone())
-            }
-            fn output_hint() -> String {
-                $out_hint
             }
         }
 
@@ -99,9 +93,6 @@ macro_rules! handle_common {
                         Err(type_mismatch($pyname, b))
                     }
                 })
-            }
-            fn input_hint() -> String {
-                $in_hint
             }
         }
     };
@@ -127,9 +118,7 @@ pub struct List<T> {
     _types: PhantomData<fn() -> T>,
 }
 
-handle_common!(List<T>, PyList, "list",
-    in: format!("list[{}]", T::input_hint()),
-    out: format!("list[{}]", T::output_hint()));
+handle_common!(List<T>, PyList, "list");
 
 impl<T> List<T> {
     /// Creates a new empty Python `list`.
@@ -242,9 +231,7 @@ pub struct Dict<K, V> {
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-handle_common!(Dict<K, V>, PyDict, "dict",
-    in: format!("dict[{}, {}]", K::input_hint(), V::input_hint()),
-    out: format!("dict[{}, {}]", K::output_hint(), V::output_hint()));
+handle_common!(Dict<K, V>, PyDict, "dict");
 
 impl<K, V> Dict<K, V> {
     /// Creates a new empty Python `dict`.
@@ -380,9 +367,7 @@ pub struct Set<T> {
     _types: PhantomData<fn() -> T>,
 }
 
-handle_common!(Set<T>, PySet, "set",
-    in: format!("set[{}]", T::input_hint()),
-    out: format!("set[{}]", T::output_hint()));
+handle_common!(Set<T>, PySet, "set");
 
 impl<T> Set<T> {
     /// Creates a new empty Python `set`.

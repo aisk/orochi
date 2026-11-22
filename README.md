@@ -19,10 +19,6 @@ mod mylib {
         a + b.unwrap_or(1)
     }
 
-    pub fn count_lines(text: &str) -> usize {
-        text.lines().count()
-    }
-
     pub fn total(xs: &[f64]) -> f64 {
         xs.iter().sum()
     }
@@ -53,10 +49,9 @@ mod mylib {
         pub fn norm(&self) -> f64 {                 // a method
             self.x.hypot(self.y)
         }
-        pub fn scale(&mut self, k: f64) -> &mut Self {
+        pub fn scale(&mut self, k: f64) {           // modifies the instance
             self.x *= k;
             self.y *= k;
-            self                                    // returns the same object
         }
         pub fn origin() -> Self {                   // no `self`: a static method
             Point::new(0.0, 0.0)
@@ -70,15 +65,6 @@ mod mylib {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "({}, {})", self.x, self.y)
         }
-    }
-
-    pub enum Color {                                // members: Color.Red, Color.Green
-        Red,
-        Green,
-    }
-
-    pub fn favorite() -> Color {
-        Color::Red
     }
 
     pub mod geometry {                              // the submodule `mylib.geometry`
@@ -103,11 +89,12 @@ mylib.push_twice(xs, 5)      # xs == [1, 5, 5]: a `List<i64>` is the caller's li
 p = mylib.Point(3, 4)
 p.norm()                     # 5.0
 p.x = 6
-p.scale(2).scale(0.5) is p   # True
-p == mylib.Point(6, 4)       # True (`PartialEq`)
-repr(p)                      # 'Point { x: 6.0, y: 4.0, cache: None }' (`Debug`)
-str(p)                       # '(6, 4)' (`Display`)
+p.scale(0.5)                 # p is now (3, 2)
+p == mylib.Point(3, 2)       # True (`PartialEq`)
+repr(p)                      # 'Point { x: 3.0, y: 2.0, cache: None }' (`Debug`)
+str(p)                       # '(3, 2)' (`Display`)
 mylib.geometry.area(1.0)
+help(mylib.Point.dist)       # dist(self, /, other)
 ```
 
 The items stay ordinary Rust: `mylib::add(1, None)` and
@@ -115,99 +102,112 @@ The items stay ordinary Rust: `mylib::add(1, None)` and
 
 ## The rules
 
-**`pub` means exported.** Plain `pub` functions, structs, fieldless enums,
-constants, statics and inline `pub mod`s are exported; private and
-`pub(crate)` items are not. Doc comments become `__doc__`.
+**`pub` means exported.** Plain `pub` functions, structs, constants, statics
+and inline `pub mod`s are exported; private and `pub(crate)` items are not.
+Doc comments become `__doc__`. In a struct's `impl`, `pub fn new` is the
+constructor, `pub fn`s with `self` are methods, those without are static
+methods and `pub const`s are class attributes. `Debug`, `Display`,
+`PartialEq` and `Hash` (derived or implemented) become `__repr__`,
+`__str__`, `__eq__` and `__hash__`.
 
 Everything else follows from three rules:
 
 1. **Rust types are values.** `i64`, `String`, `Vec<T>`, `HashMap<K, V>`,
    `PathBuf`, tuples, ... are converted (copied) on the way in and on the way
-   out. `&str`, `&[T]`, `&Path`, `&HashMap<K, V>`, `Option<&T>` parameters
-   borrow that converted copy: nothing the function does is visible to the
-   caller. A returned `Vec<T>` is a new `list`, a `HashMap` a new `dict` in
-   arbitrary order (use `BTreeMap` for a sorted, stable order).
+   out. `&str`, `&[T]`, `&Path`, `&HashMap<K, V>` and `Option<&str>`
+   parameters borrow that converted copy: nothing the function does is
+   visible to the caller.
 2. **orochi types are references.** `Object`, `List<T>`, `Dict<K, V>`,
    `Set<T>` and `Ref<T>` refer to the caller's Python object itself: take a
    `List<T>` to modify the caller's list, or to keep an object's identity.
-3. **Your own classes** (`pub struct`s of the module): `&Point`,
-   `&mut Point`, `&self` and `&mut self` borrow the instance itself (a
-   conflicting borrow raises `RuntimeError`); by value is a copy (the class
-   must be `Clone`); `Ref<Point>` is a handle. Any other Python type is an
-   `Object`.
+3. **Your own classes are borrowed.** `&self`, `&mut self`, `&Point`,
+   `&mut Point` and `Option<&Point>` borrow the instance itself; a
+   conflicting borrow (`p.absorb(p)` with `&mut self` and `&Point`) raises
+   `RuntimeError`. By value (`p: Point`) is a copy, so the class must be
+   `Clone`; `Ref<Point>` is a handle.
 
-`&mut` of anything but a class is a compile error. To modify the caller's
-list, dict or set, take `List<T>` / `Dict<K, V>` / `Set<T>`, which need no
-`&mut`; other Python values (`str`, `int`, tuples, ...) are immutable, so
-return the new value.
-Trailing `Option` parameters default to `None`.
+`&mut` of anything but a class is a compile error: take `List<T>`,
+`Dict<K, V>` or `Set<T>` to modify the caller's container; other Python
+values are immutable, so return the new value. Trailing `Option` parameters
+default to `None`. Conversions are strict: a `float` is not an `int`, a
+`bool` is not a number, a `str` is not a list, and a wrong argument raises
+`TypeError` naming the parameter.
 
-Fields follow the same rules:
+**Fields.** A `pub` field is a read/write property if its type is a simple
+value (numbers, `bool`, `char`, `String`, `PathBuf`) or an orochi reference
+(`Object`, `List<T>`, `Dict<K, V>`, `Set<T>`, `Ref<T>`), or an `Option` of
+those. Any other type is a compile error: a `pub items: Vec<i64>` would
+hand Python a copy that silently ignores `b.items.append(3)`. Use
+`List<i64>` for a list Python can modify, or keep the field private and
+write methods.
 
-```rust
-# use orochi::List;
-pub struct Basket {
-    pub items: Vec<i64>,    // value: Python reads an immutable snapshot (a tuple); assign to replace
-    pub tags: List<String>, // reference: a real Python list, mutable in place
+**Return values.** Any convertible value (numbers, `String`, `Vec<T>`,
+maps, `Object`, `List<T>`, `Ref<T>`, ...), `()` (`None`), and `Option` /
+`Result` of those; a class by value (a new instance) as `Point`,
+`Option<Point>` or `Result<Point, E>`. `Result<T, E>` needs
+`E: Into<orochi::Error>` and raises on `Err` (`std::io::Error` maps to the
+matching `OSError` subclass). Borrowed values cannot be returned: return
+`String`, not `&str`; a method that modifies `self` returns `()`. A panic
+raises `PanicException` instead of aborting.
+
+## What the macro generates
+
+`#[orochi::module]` only reads names, signatures and doc comments. It adds
+pyo3's `#[pyclass]` to each `pub struct`, a `#[new]` calling
+`orochi::construct` for `pub fn new` (so Python cannot create an instance
+without it), and plain calls to `orochi::ModuleBuilder` /
+`orochi::ClassBuilder`, roughly:
+
+```rust,ignore
+#[pymethods]
+impl Point {
+    #[new]
+    #[pyo3(signature = (*args, **kwargs), text_signature = "(x, y)")]
+    fn __orochi_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        orochi::construct(&["x", "y"], Point::new, args, kwargs)
+    }
+}
+
+pub fn __orochi_init(__orochi_m: &orochi::ModuleBuilder<'_>) -> orochi::Result<()> {
+    __orochi_m.doc("My first extension module.")?;
+    let __orochi_c = __orochi_m.class::<Point>()?;
+    __orochi_c.field("x", "", |s: &Point| &s.x, |s: &mut Point| &mut s.x)?;
+    __orochi_c.method("norm", &[], "", Point::norm)?;
+    __orochi_c.method("dist", &["other"], "", Point::dist)?;
+    __orochi_c.static_method("origin", &[], "", Point::origin)?;
+    __orochi_c.repr_debug()?;
+    __orochi_c.str_display()?;
+    __orochi_c.eq()?;
+    __orochi_m.function("add", &["a", "b"], "Add two integers.", self::add)?;
+    __orochi_m.submodule("geometry", "", self::geometry::__orochi_init)?;
+    Ok(())
 }
 ```
 
-```python
-b.tags.append("x")   # changes the basket's list
-b.items = [1, 2]     # replaces the value
-b.items              # (1, 2)
-b.items.append(3)    # AttributeError: 'tuple' object has no attribute 'append'
-```
+plus a `#[pymodule]` entry point calling it. The same builder works by hand
+with a `#[pyclass]` of your own; the `ModuleBuilder` documentation shows a
+complete hand-written module. `Debug`, `Display`, `PartialEq` and `Hash` are
+recognized by name, in `#[derive(...)]` or in `impl ... for` the class.
 
-The `Vec` lives in the Rust struct, so Python can only be handed a snapshot
-of it: `Vec<T>` and arrays read as a `tuple`, sets as a `frozenset`, maps as
-a read-only `types.MappingProxyType`, also nested (a `Vec<u8>` reads as
-`bytes`), so a mutation fails instead of changing a copy. A snapshot is not a
-list: `b.items == [1, 2]` is `False`, compare with `(1, 2)`.
-`list(b.items)`, `dict(b.table)` and `set(b.tags)` give mutable copies (also
-what `json` and `pickle` need). References inside a value pass through
-(`Vec<Ref<Point>>` reads as a tuple of the instances), and a type with a
-hand-written `IntoObject` is handed over exactly as it builds it. A class
-held by value in a field is a compile error (`pub center: Point`,
-`pub points: Vec<Point>`): use `Ref<Point>` / `Vec<Ref<Point>>`, so that
-`c.center is p`. Enum members are immutable singletons and fine by value.
+## Not supported (yet)
 
-Conversions are strict: a `float` is not an `int`, a `bool` is not a number,
-a `str` is not a list (see `orochi::IntoObject` / `orochi::FromObject`).
-Wrong arguments raise `TypeError`.
+Compile errors on `pub` items (make the item private to keep it Rust-only):
+enums, generic or `async` functions, more than 12 parameters,
+`impl Trait`, explicit lifetimes (`'_` is fine), returning borrowed values,
+hand-written special methods (`__len__`, ...), `pub` fields of other types
+than above, `pub use`, `pub trait`, an `impl` with `pub` items for a struct
+of another module, Python keywords as names (`r#in`), names starting with
+`__orochi`.
 
-**Return values.** A method returning `&Self` or `&mut Self` returns the same
-object (so calls can be chained); a reference to a *different* instance is
-copied when the class is `Clone` and raises `RuntimeError` otherwise. Other
-references (`&str`, `&[T]`, ...) are copied. `Result<T, E>` raises when it is
-`Err`: `std::io::Error` maps to the matching `OSError` subclass,
-`orochi::Error` to its own exception, and any other `E: Display` to
-`RuntimeError`. A panic raises `PanicException` instead of aborting.
+Classes by value work alone, in `Option` or in `Result` as return values,
+and alone as parameters; not as `Vec<Point>`, `(Point, Point)` or
+`Result<Option<Point>, E>` returns, nor as `Option<Point>` or `Vec<Point>`
+parameters: use `Ref<Point>` there (`Vec<Ref<Point>>`, `Option<Ref<Point>>`).
 
-**Classes.** A `pub struct` is a class. `pub fn new` (without `self`) is the
-constructor, other `pub fn`s with `self` are methods, those without are static
-methods, `pub const`s in the `impl` are class attributes, and `pub` fields are
-attributes. `Debug`, `Display`, `PartialEq` and `Hash` (derived or
-implemented) become `__repr__`, `__str__`, `__eq__` and `__hash__`; a class
-with `PartialEq` but no `Hash` is unhashable, like in Python, and `Hash`
-without `PartialEq` is a compile error.
-
-A fieldless `pub enum` is a class whose members are attributes: they are
-singletons (`mylib.favorite() is mylib.Color.Red`), compare and hash by
-member whatever the enum derives, and only members are accepted as arguments.
-The class is not iterable or callable (`list(Color)` and `Color(1)` raise
-`TypeError`). Rust returns the member objects that existed when the class was
-created, even if `Color.Red` is later reassigned in Python; the stubs mark
-members `Final`, so type checkers reject such an assignment, but the runtime
-does not.
-
-Unsupported items (generic or `async` functions, `impl Trait` parameters,
-explicit lifetimes, enums with data, `pub use`, `pub trait`, Python keywords
-such as `r#in` as names, names starting with `_orochi` or `__orochi`, which
-orochi reserves, ...) are compile errors when `pub`; make them private to keep
-them Rust-only. Items produced by a `macro_rules!` macro inside the
-module are not exported: the attribute only sees the macro call, not the
-items it expands to.
+Not seen by the macro: items produced by a `macro_rules!` macro inside the
+module, and derives behind `#[cfg_attr(..., derive(...))]`. Also missing:
+`.pyi` type stubs, subclassing, keyword-only and `*args` parameters,
+defaults other than `None`, buffers.
 
 ## Building an extension module
 
@@ -225,76 +225,6 @@ hand: `cargo build`, then copy the library to a directory on Python's path as
 `PYO3_BUILD_EXTENSION_MODULE=1` when building, as maturin does). The file name
 must match the module name. `examples/demo` is a complete example; on Windows
 `examples\demo\run.ps1` builds it and imports it with Python.
-
-## Type stubs
-
-Every `#[orochi::module]` can write `.pyi` stubs for itself, so that editors
-and type checkers understand it like a typed Python library. With the built
-module:
-
-```sh
-python -c "import mylib; mylib._orochi_stubs('typings')"
-```
-
-This writes `typings/mylib.pyi`, or a stub package (`typings/mylib/__init__.pyi`,
-`typings/mylib/geometry.pyi`, ...) when the module has submodules, and removes
-the stubs of the other layout that orochi generated earlier (files it did not
-write are kept); `mylib._orochi_stubs()` without a directory only returns
-`{relative path: text}`. Pyright and Pylance read `typings/` by default; for
-mypy set `mypy_path = typings`. `_orochi_stubs` itself is hidden: it is not in
-`__all__` nor in the stubs.
-
-To ship the stubs with the module (PEP 561), either:
-
-- with maturin and a module without submodules, put `mylib.pyi` beside
-  `Cargo.toml`: maturin packages it as `mylib/__init__.pyi` with a `py.typed`
-  marker. Stubs of submodules are not picked up this way.
-- publish a separate stub-only package whose files are the stub package in a
-  directory named `mylib-stubs/` (`mylib-stubs/__init__.pyi`,
-  `mylib-stubs/geometry.pyi`, ...); type checkers prefer it to the module.
-
-Both were checked with mypy 2.4.1 and pyright 1.1.407 against
-`examples/demo` installed from a wheel built by `maturin build` (maturin
-1.9.6), with `mylib-stubs/` copied into the environment's `site-packages`;
-building and publishing the stub-only distribution itself was not tested.
-
-The same from Rust, e.g. in a test of the extension crate (no interpreter is
-started, although the test binary links Python like any other):
-
-```rust,no_run
-#[orochi::module]
-mod mylib {
-    pub fn add(a: i64, b: Option<i64>) -> i64 {
-        a + b.unwrap_or(1)
-    }
-}
-
-#[test]
-fn write_stubs() {
-    orochi::write_stubs(&mylib::__orochi_stubs(), "typings").unwrap();
-}
-```
-
-Stubs include docstrings, parameter names and `None` defaults, and the
-types the conversions really accept and return: `Vec<T>` parameters take any
-`collections.abc.Sequence[T]`, `HashMap<K, V>` any
-`collections.abc.Mapping[K, V]` (also a field's `MappingProxyType`);
-`Result<T, E>` returns `T` and `&mut Self`
-the class. A field is a property typed with what reading it returns
-(`tuple[int, ...]` for a `Vec<i64>`) and a setter typed with what assigning
-accepts. Classes are `@typing.final` with `__new__` from `new` (a class
-without `new`, and an enum, gets a `__new__` that no call matches); enum
-members are `Final` attributes of their class.
-
-Stubs are looser than the runtime in places: an integer or string type only
-says `int` / `str` (not the range of a `u8`, say), and a custom conversion is
-only as precise as its hint. In one place they are stricter: a map whose keys
-are paths (`HashMap<PathBuf, V>`) accepts `Mapping[str | os.PathLike[str], V]`
-but reads back with `pathlib.Path` keys, and since `Mapping` is invariant in
-its key type, a type checker rejects passing the read-back mapping in again
-(`b.by_path = b.by_path`) although it works at runtime. A custom `FromObject` / `IntoObject` hint is used
-as written: spell names fully qualified (`typing.Any`,
-`numpy.typing.NDArray[numpy.float64]`) and the stub imports their modules.
 
 ## Embedding Python
 
@@ -360,8 +290,6 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 .\examples\demo\run.ps1   # builds the demo extension and imports it with Python
                           # (`py -3` or `python`; or pass -Python <python.exe>)
-.\examples\demo\run.ps1 -TypeCheck   # also checks its stubs with mypy (needs uv):
-                                     # stubtest, typecheck/good.py, typecheck/bad.py
 ```
 
 `PYO3_PYTHON` can be set to select the interpreter used at build time.

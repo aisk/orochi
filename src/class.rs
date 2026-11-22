@@ -1,5 +1,4 @@
-//! Classes defined with `#[orochi::module]`: the [`Class`] trait and the
-//! [`Ref`] handle.
+//! Classes: the [`Class`] trait and the [`Ref`] handle.
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -15,30 +14,41 @@ use crate::runtime::attach;
 
 /// A Rust type exposed to Python as a class.
 ///
-/// Implemented by `#[orochi::module]` for every `pub struct` (and fieldless
-/// `pub enum`) in the module; do not implement it by hand.
+/// Implemented automatically for every type with pyo3's `#[pyclass]`
+/// (`#[orochi::module]` adds it to each `pub struct`) that is not `frozen`
+/// and is `Send + Sync`. The class gets its methods and properties from
+/// [`ClassBuilder`](crate::ClassBuilder), and its constructor from a
+/// `#[new]` that calls [`construct`](crate::construct).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a Python class",
+    label = "not a `pub struct` of an `#[orochi::module]` (or a `#[pyclass]` type)",
+    note = "`&mut` parameters work only for classes: to modify the caller's list, dict or set, \
+            take `List<T>`, `Dict<K, V>` or `Set<T>`; other Python values are immutable, so \
+            return the new value"
+)]
 pub trait Class:
-    pyo3::PyClass<Frozen = False> + Into<PyClassInitializer<Self>> + Send + Sync
+    pyo3::PyClass<Frozen = False> + Into<PyClassInitializer<Self>> + Send + Sync + 'static
 {
-    /// The qualified Python name, e.g. `"mylib.Point"`.
-    #[doc(hidden)]
-    const PYTHON_NAME: &'static str;
+}
+
+impl<T> Class for T where
+    T: pyo3::PyClass<Frozen = False> + Into<PyClassInitializer<T>> + Send + Sync + 'static
+{
 }
 
 /// A reference to an instance of a [`Class`] living in Python.
 ///
-/// Taking or storing a class *by value* copies it (`p: Point` is a new,
-/// independent `Point`). A `Ref<Point>` instead refers to one Python object:
-/// every `Ref` to it, and every Python variable bound to it, sees the same
-/// data. Use it for fields, parameters and return values that must keep
-/// identity:
+/// Taking a class by value copies it (`p: Point` is a new, independent
+/// `Point`, and needs `Clone`). A `Ref<Point>` instead refers to one Python
+/// object: every `Ref` to it, and every Python variable bound to it, sees
+/// the same data. Use it for fields, parameters and return values that must
+/// keep identity:
 ///
 /// ```
 /// #[orochi::module]
 /// mod shapes {
 ///     use orochi::prelude::*;
 ///
-///     #[derive(Clone)]
 ///     pub struct Point { pub x: f64, pub y: f64 }
 ///
 ///     pub struct Circle { pub center: Ref<Point>, pub radius: f64 }
@@ -108,18 +118,6 @@ impl<T: Class> Ref<T> {
     pub fn to_object(&self) -> Object {
         self.clone().into()
     }
-
-    /// Wraps a pyo3 reference.
-    #[doc(hidden)]
-    pub fn from_py(obj: Py<T>) -> Ref<T> {
-        Ref(obj)
-    }
-
-    /// Borrows the underlying pyo3 reference.
-    #[doc(hidden)]
-    pub fn as_py(&self) -> &Py<T> {
-        &self.0
-    }
 }
 
 impl<T: Class> Clone for Ref<T> {
@@ -154,9 +152,6 @@ impl<T: Class> IntoObject for Ref<T> {
     fn into_object(self) -> Result<Object> {
         Ok(self.into())
     }
-    fn output_hint() -> String {
-        T::PYTHON_NAME.to_owned()
-    }
 }
 
 /// Passes the referenced object itself (no copy).
@@ -164,24 +159,18 @@ impl<T: Class> IntoObject for &Ref<T> {
     fn into_object(self) -> Result<Object> {
         Ok(self.clone().into())
     }
-    fn output_hint() -> String {
-        T::PYTHON_NAME.to_owned()
-    }
 }
 
-/// Accepts an instance of `T` (or a subclass) without copying it.
+/// Accepts an instance of `T` without copying it.
 impl<T: Class> FromObject for Ref<T> {
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);
             match b.cast::<T>() {
                 Ok(instance) => Ok(Ref(instance.clone().unbind())),
-                Err(_) => Err(type_mismatch(T::PYTHON_NAME, b)),
+                Err(_) => Err(type_mismatch(T::NAME, b)),
             }
         })
-    }
-    fn input_hint() -> String {
-        T::PYTHON_NAME.to_owned()
     }
 }
 

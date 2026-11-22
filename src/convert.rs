@@ -30,11 +30,6 @@
 //!
 //! `memoryview` (and other buffer objects) are rejected; buffer support is
 //! not part of orochi yet.
-//!
-//! Both traits also describe the Python type as a type-hint string; this is
-//! used to render signatures and `.pyi` stubs. Hints use fully qualified
-//! names for anything outside builtins (`typing.Any`,
-//! `collections.abc.Sequence[int]`).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -57,12 +52,6 @@ use crate::runtime::attach;
 /// Implement this for your own types by building the object with orochi's
 /// API, e.g. returning a `dict` or calling a Python class.
 ///
-/// A `pub` field of such a type is read through the same conversion, so the
-/// object is handed over exactly as built: unlike orochi's own containers it
-/// is not made immutable. Return an immutable object (a `tuple`, `bytes`,
-/// ...) or an orochi reference if changing it from Python must not be
-/// silently lost.
-///
 /// ```
 /// use orochi::{IntoObject, Object};
 ///
@@ -72,9 +61,6 @@ use crate::runtime::attach;
 ///     fn into_object(self) -> orochi::Result<Object> {
 ///         (self.x, self.y).into_object()
 ///     }
-///     fn output_hint() -> String {
-///         "tuple[float, float]".to_owned()
-///     }
 /// }
 ///
 /// let p = Point { x: 1.0, y: 2.0 }.into_object()?;
@@ -83,76 +69,26 @@ use crate::runtime::attach;
 /// ```
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be converted into a Python object",
-    label = "does not implement `orochi::IntoObject`",
-    note = "a struct or enum defined in an `#[orochi::module]` is convertible when it is `pub` \
-            (and therefore a Python class); other types need an `IntoObject` implementation"
+    label = "does not implement `orochi::IntoObject`"
 )]
 pub trait IntoObject {
     /// Performs the conversion.
     fn into_object(self) -> Result<Object>;
 
-    /// The Python type hint of the produced object, e.g. `"list[int]"`.
-    fn output_hint() -> String
-    where
-        Self: Sized;
-
-    /// Converts a `Vec<Self>`: a `list`, or with `frozen` a `tuple` of
-    /// frozen elements (see [`__into_frozen`](IntoObject::__into_frozen)).
-    /// Overridden by `u8` to produce `bytes`.
+    /// Converts a `Vec<Self>`: a `list`. Overridden by `u8` to produce
+    /// `bytes`.
     #[doc(hidden)]
-    fn __vec_into_object(items: Vec<Self>, frozen: bool) -> Result<Object>
+    fn __vec_into_object(items: Vec<Self>) -> Result<Object>
     where
         Self: Sized,
     {
         attach(|py| {
             let items = items
                 .into_iter()
-                .map(|item| {
-                    let object = if frozen { item.__into_frozen() } else { item.into_object() };
-                    Ok(object?.into_py().into_bound(py))
-                })
+                .map(|item| into_bound(py, item))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Object::from_bound(if frozen {
-                PyTuple::new(py, items)?.into_any()
-            } else {
-                PyList::new(py, items)?.into_any()
-            }))
+            Ok(Object::from_bound(PyList::new(py, items)?.into_any()))
         })
-    }
-
-    /// Hint for [`__vec_into_object`](IntoObject::__vec_into_object).
-    #[doc(hidden)]
-    fn __vec_output_hint(frozen: bool) -> String
-    where
-        Self: Sized,
-    {
-        if frozen {
-            format!("tuple[{}, ...]", Self::__frozen_hint())
-        } else {
-            format!("list[{}]", Self::output_hint())
-        }
-    }
-
-    /// Converts the value of a class field: Rust containers become immutable
-    /// snapshots, deeply (`tuple`, `frozenset`, `types.MappingProxyType`), so
-    /// that changing what Python reads cannot silently change only a copy.
-    /// Anything else (scalars, strings, `Object`, handles, `Ref`, custom
-    /// conversions) converts with [`into_object`](IntoObject::into_object).
-    #[doc(hidden)]
-    fn __into_frozen(self) -> Result<Object>
-    where
-        Self: Sized,
-    {
-        self.into_object()
-    }
-
-    /// Hint for [`__into_frozen`](IntoObject::__into_frozen).
-    #[doc(hidden)]
-    fn __frozen_hint() -> String
-    where
-        Self: Sized,
-    {
-        Self::output_hint()
     }
 }
 
@@ -167,9 +103,6 @@ pub trait IntoObject {
 ///     fn from_object(obj: &Object) -> orochi::Result<Self> {
 ///         Ok(Celsius(obj.to::<f64>()?))
 ///     }
-///     fn input_hint() -> String {
-///         "float".to_owned()
-///     }
 /// }
 ///
 /// let c: Celsius = orochi::eval("21.5")?.to()?;
@@ -180,29 +113,22 @@ pub trait IntoObject {
     message = "`{Self}` cannot be converted from a Python object",
     label = "does not implement `orochi::FromObject`",
     note = "implement `orochi::FromObject` for `{Self}`, or take a type that already \
-            implements it (numbers, `String`, `Vec<T>`, maps, `Object`, ...)",
-    note = "if `{Self}` is a class of an `#[orochi::module]`: taking it by value means taking \
-            a copy, which needs `#[derive(Clone)]`; take `&{Self}`, `&mut {Self}` or \
-            `Ref<{Self}>` to use the caller's instance itself"
+            implements it (numbers, `String`, `Vec<T>`, maps, `Object`, ...)"
 )]
 pub trait FromObject: Sized {
     /// Performs the conversion. Fails with `TypeError` if the object has the
     /// wrong type, or with the error Python raised (e.g. `OverflowError`).
     fn from_object(obj: &Object) -> Result<Self>;
 
-    /// The Python type hint of accepted objects, e.g. `"int"`.
-    fn input_hint() -> String;
+    /// May a parameter of this type be omitted in a call from Python? It is
+    /// then converted from `None`. `true` for `Option<T>`: a trailing
+    /// `Option` parameter defaults to `None`.
+    const OPTIONAL: bool = false;
 
     /// Converts to `Vec<Self>`. Overridden by `u8` to accept `bytes`.
     #[doc(hidden)]
     fn __vec_from_object(obj: &Object) -> Result<Vec<Self>> {
         vec_from_sequence(obj, "a sequence")
-    }
-
-    /// Hint for `Vec<Self>`.
-    #[doc(hidden)]
-    fn __vec_input_hint() -> String {
-        format!("collections.abc.Sequence[{}]", Self::input_hint())
     }
 }
 
@@ -232,11 +158,6 @@ pub(crate) fn snapshot<'py>(obj: &Bound<'py, PyAny>) -> Result<Bound<'py, PyList
     let py = obj.py();
     let list = py.get_type::<PyList>().call1((obj,))?;
     Ok(list.cast_into::<PyList>()?)
-}
-
-/// `T | None`, without repeating `None`.
-pub fn optional_hint(hint: String) -> String {
-    if hint.split(" | ").any(|part| part == "None") { hint } else { format!("{hint} | None") }
 }
 
 /// The default `Vec<T>` conversion: any sequence except text, bytes and
@@ -328,26 +249,17 @@ impl IntoObject for Object {
     fn into_object(self) -> Result<Object> {
         Ok(self)
     }
-    fn output_hint() -> String {
-        "typing.Any".to_owned()
-    }
 }
 
 impl IntoObject for &Object {
     fn into_object(self) -> Result<Object> {
         Ok(self.clone())
     }
-    fn output_hint() -> String {
-        "typing.Any".to_owned()
-    }
 }
 
 impl FromObject for Object {
     fn from_object(obj: &Object) -> Result<Self> {
         Ok(obj.clone())
-    }
-    fn input_hint() -> String {
-        "typing.Any".to_owned()
     }
 }
 
@@ -357,9 +269,6 @@ impl<T: IntoObject, E: Into<Error>> IntoObject for std::result::Result<T, E> {
     fn into_object(self) -> Result<Object> {
         self.map_err(Into::into)?.into_object()
     }
-    fn output_hint() -> String {
-        T::output_hint()
-    }
 }
 
 /// Converts the boxed value.
@@ -367,24 +276,12 @@ impl<T: IntoObject> IntoObject for Box<T> {
     fn into_object(self) -> Result<Object> {
         (*self).into_object()
     }
-    fn output_hint() -> String {
-        T::output_hint()
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        (*self).__into_frozen()
-    }
-    fn __frozen_hint() -> String {
-        T::__frozen_hint()
-    }
 }
 
 /// Converts like `T`.
 impl<T: FromObject> FromObject for Box<T> {
     fn from_object(obj: &Object) -> Result<Self> {
         T::from_object(obj).map(Box::new)
-    }
-    fn input_hint() -> String {
-        T::input_hint()
     }
 }
 
@@ -396,17 +293,11 @@ macro_rules! int_impls {
             fn into_object(self) -> Result<Object> {
                 attach(|py| Ok(Object::from_bound(self.into_bound_py_any(py)?)))
             }
-            fn output_hint() -> String {
-                "int".to_owned()
-            }
         }
 
         impl FromObject for $t {
             fn from_object(obj: &Object) -> Result<Self> {
                 extract_int::<$t>(obj, $unsigned)
-            }
-            fn input_hint() -> String {
-                "int".to_owned()
             }
         }
     )*};
@@ -421,24 +312,14 @@ impl IntoObject for u8 {
     fn into_object(self) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(self.into_bound_py_any(py)?)))
     }
-    fn output_hint() -> String {
-        "int".to_owned()
-    }
-    /// `bytes`, which is immutable, so also when `frozen`.
-    fn __vec_into_object(items: Vec<Self>, _frozen: bool) -> Result<Object> {
+    fn __vec_into_object(items: Vec<Self>) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(PyBytes::new(py, &items).into_any())))
-    }
-    fn __vec_output_hint(_frozen: bool) -> String {
-        "bytes".to_owned()
     }
 }
 
 impl FromObject for u8 {
     fn from_object(obj: &Object) -> Result<Self> {
         extract_int::<u8>(obj, true)
-    }
-    fn input_hint() -> String {
-        "int".to_owned()
     }
     fn __vec_from_object(obj: &Object) -> Result<Vec<Self>> {
         let direct = attach(|py| {
@@ -456,17 +337,11 @@ impl FromObject for u8 {
             None => vec_from_sequence(obj, "bytes, bytearray or a sequence of int"),
         }
     }
-    fn __vec_input_hint() -> String {
-        "bytes | bytearray | collections.abc.Sequence[int]".to_owned()
-    }
 }
 
 impl IntoObject for f64 {
     fn into_object(self) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(self.into_bound_py_any(py)?)))
-    }
-    fn output_hint() -> String {
-        "float".to_owned()
     }
 }
 
@@ -474,17 +349,11 @@ impl FromObject for f64 {
     fn from_object(obj: &Object) -> Result<Self> {
         extract_f64(obj)
     }
-    fn input_hint() -> String {
-        "float".to_owned()
-    }
 }
 
 impl IntoObject for f32 {
     fn into_object(self) -> Result<Object> {
         f64::from(self).into_object()
-    }
-    fn output_hint() -> String {
-        "float".to_owned()
     }
 }
 
@@ -499,17 +368,11 @@ impl FromObject for f32 {
         }
         Ok(narrow)
     }
-    fn input_hint() -> String {
-        "float".to_owned()
-    }
 }
 
 impl IntoObject for bool {
     fn into_object(self) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(self.into_bound_py_any(py)?)))
-    }
-    fn output_hint() -> String {
-        "bool".to_owned()
     }
 }
 
@@ -523,9 +386,6 @@ impl FromObject for bool {
             }
         })
     }
-    fn input_hint() -> String {
-        "bool".to_owned()
-    }
 }
 
 // ---------------------------------------------------------------- strings
@@ -534,17 +394,11 @@ impl IntoObject for &str {
     fn into_object(self) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(PyString::new(py, self).into_any())))
     }
-    fn output_hint() -> String {
-        "str".to_owned()
-    }
 }
 
 impl IntoObject for String {
     fn into_object(self) -> Result<Object> {
         self.as_str().into_object()
-    }
-    fn output_hint() -> String {
-        "str".to_owned()
     }
 }
 
@@ -552,17 +406,11 @@ impl IntoObject for &String {
     fn into_object(self) -> Result<Object> {
         self.as_str().into_object()
     }
-    fn output_hint() -> String {
-        "str".to_owned()
-    }
 }
 
 impl IntoObject for Cow<'_, str> {
     fn into_object(self) -> Result<Object> {
         self.as_ref().into_object()
-    }
-    fn output_hint() -> String {
-        "str".to_owned()
     }
 }
 
@@ -576,9 +424,6 @@ impl FromObject for String {
             }
         })
     }
-    fn input_hint() -> String {
-        "str".to_owned()
-    }
 }
 
 /// Always produces `Cow::Owned`.
@@ -586,17 +431,11 @@ impl FromObject for Cow<'static, str> {
     fn from_object(obj: &Object) -> Result<Self> {
         String::from_object(obj).map(Cow::Owned)
     }
-    fn input_hint() -> String {
-        "str".to_owned()
-    }
 }
 
 impl IntoObject for char {
     fn into_object(self) -> Result<Object> {
         self.encode_utf8(&mut [0; 4]).into_object()
-    }
-    fn output_hint() -> String {
-        "str".to_owned()
     }
 }
 
@@ -613,9 +452,6 @@ impl FromObject for char {
             ))),
         }
     }
-    fn input_hint() -> String {
-        "str".to_owned()
-    }
 }
 
 // ---------------------------------------------------------------- paths
@@ -625,9 +461,6 @@ impl IntoObject for PathBuf {
     fn into_object(self) -> Result<Object> {
         self.as_path().into_object()
     }
-    fn output_hint() -> String {
-        "pathlib.Path".to_owned()
-    }
 }
 
 /// Becomes a `pathlib.Path`.
@@ -635,18 +468,12 @@ impl IntoObject for &PathBuf {
     fn into_object(self) -> Result<Object> {
         self.as_path().into_object()
     }
-    fn output_hint() -> String {
-        "pathlib.Path".to_owned()
-    }
 }
 
 /// Becomes a `pathlib.Path`.
 impl IntoObject for &Path {
     fn into_object(self) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(self.into_bound_py_any(py)?)))
-    }
-    fn output_hint() -> String {
-        "pathlib.Path".to_owned()
     }
 }
 
@@ -663,9 +490,6 @@ impl FromObject for PathBuf {
             Ok(b.extract::<PathBuf>()?)
         })
     }
-    fn input_hint() -> String {
-        "str | os.PathLike[str]".to_owned()
-    }
 }
 
 // ---------------------------------------------------------------- None / Option
@@ -674,9 +498,6 @@ impl FromObject for PathBuf {
 impl IntoObject for () {
     fn into_object(self) -> Result<Object> {
         Ok(Object::none())
-    }
-    fn output_hint() -> String {
-        "None".to_owned()
     }
 }
 
@@ -688,9 +509,6 @@ impl FromObject for () {
             if b.is_none() { Ok(()) } else { Err(type_mismatch("None", b)) }
         })
     }
-    fn input_hint() -> String {
-        "None".to_owned()
-    }
 }
 
 /// `None` maps to `None`, `Some(v)` to `v`.
@@ -701,26 +519,12 @@ impl<T: IntoObject> IntoObject for Option<T> {
             None => Ok(Object::none()),
         }
     }
-    fn output_hint() -> String {
-        optional_hint(T::output_hint())
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        match self {
-            Some(v) => v.__into_frozen(),
-            None => Ok(Object::none()),
-        }
-    }
-    fn __frozen_hint() -> String {
-        optional_hint(T::__frozen_hint())
-    }
 }
 
 impl<T: FromObject> FromObject for Option<T> {
+    const OPTIONAL: bool = true;
     fn from_object(obj: &Object) -> Result<Self> {
         if obj.is_none() { Ok(None) } else { T::from_object(obj).map(Some) }
-    }
-    fn input_hint() -> String {
-        optional_hint(T::input_hint())
     }
 }
 
@@ -729,26 +533,14 @@ impl<T: FromObject> FromObject for Option<T> {
 /// Becomes a new `list` (`bytes` for `Vec<u8>`).
 impl<T: IntoObject> IntoObject for Vec<T> {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(self, false)
-    }
-    fn output_hint() -> String {
-        T::__vec_output_hint(false)
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        T::__vec_into_object(self, true)
-    }
-    fn __frozen_hint() -> String {
-        T::__vec_output_hint(true)
+        T::__vec_into_object(self)
     }
 }
 
 /// Becomes a new `list` (`bytes` for `&[u8]`).
 impl<T: IntoObject + Clone> IntoObject for &[T] {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(self.to_vec(), false)
-    }
-    fn output_hint() -> String {
-        T::__vec_output_hint(false)
+        T::__vec_into_object(self.to_vec())
     }
 }
 
@@ -757,24 +549,12 @@ impl<T: IntoObject + Clone> IntoObject for &Vec<T> {
     fn into_object(self) -> Result<Object> {
         self.as_slice().into_object()
     }
-    fn output_hint() -> String {
-        T::__vec_output_hint(false)
-    }
 }
 
 /// Becomes a new `list` (`bytes` for `[u8; N]`).
 impl<T: IntoObject, const N: usize> IntoObject for [T; N] {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(Vec::from(self), false)
-    }
-    fn output_hint() -> String {
-        T::__vec_output_hint(false)
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        T::__vec_into_object(Vec::from(self), true)
-    }
-    fn __frozen_hint() -> String {
-        T::__vec_output_hint(true)
+        T::__vec_into_object(Vec::from(self))
     }
 }
 
@@ -784,9 +564,6 @@ impl<T: IntoObject, const N: usize> IntoObject for [T; N] {
 impl<T: FromObject> FromObject for Vec<T> {
     fn from_object(obj: &Object) -> Result<Self> {
         T::__vec_from_object(obj)
-    }
-    fn input_hint() -> String {
-        T::__vec_input_hint()
     }
 }
 
@@ -798,9 +575,6 @@ impl<T: FromObject, const N: usize> FromObject for [T; N] {
         items.try_into().map_err(|_| {
             Error::type_error(format!("expected a sequence of length {N}, got length {len}"))
         })
-    }
-    fn input_hint() -> String {
-        T::__vec_input_hint()
     }
 }
 
@@ -816,25 +590,6 @@ fn dict_from_pairs<K: IntoObject, V: IntoObject>(
         }
         Ok(Object::from_bound(dict.into_any()))
     })
-}
-
-/// A read-only `types.MappingProxyType` over a new `dict` of the frozen
-/// entries.
-fn frozen_mapping<K: IntoObject, V: IntoObject>(
-    pairs: impl IntoIterator<Item = (K, V)>,
-) -> Result<Object> {
-    attach(|py| {
-        let dict = PyDict::new(py);
-        for (k, v) in pairs {
-            dict.set_item(k.__into_frozen()?.into_py(), v.__into_frozen()?.into_py())?;
-        }
-        let proxy = py.import("types")?.getattr("MappingProxyType")?.call1((dict,))?;
-        Ok(Object::from_bound(proxy))
-    })
-}
-
-fn frozen_mapping_hint<K: IntoObject, V: IntoObject>() -> String {
-    format!("types.MappingProxyType[{}, {}]", K::__frozen_hint(), V::__frozen_hint())
 }
 
 /// Converts a `dict` or any other `collections.abc.Mapping` into key/value
@@ -867,14 +622,6 @@ fn pairs_from_mapping<K: FromObject, V: FromObject>(
     })
 }
 
-fn mapping_input_hint<K: FromObject, V: FromObject>() -> String {
-    format!(
-        "collections.abc.Mapping[{}, {}]",
-        K::input_hint(),
-        V::input_hint()
-    )
-}
-
 fn set_from_items<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<Object> {
     attach(|py| {
         let set = PySet::empty(py)?;
@@ -882,17 +629,6 @@ fn set_from_items<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<O
             set.add(into_bound(py, item)?)?;
         }
         Ok(Object::from_bound(set.into_any()))
-    })
-}
-
-/// A `frozenset` of the frozen elements.
-fn frozen_set<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<Object> {
-    attach(|py| {
-        let items = items
-            .into_iter()
-            .map(|item| Ok(item.__into_frozen()?.into_py().into_bound(py)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Object::from_bound(PyFrozenSet::new(py, items)?.into_any()))
     })
 }
 
@@ -915,15 +651,6 @@ impl<K: IntoObject, V: IntoObject, S> IntoObject for HashMap<K, V, S> {
     fn into_object(self) -> Result<Object> {
         dict_from_pairs(self)
     }
-    fn output_hint() -> String {
-        format!("dict[{}, {}]", K::output_hint(), V::output_hint())
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        frozen_mapping(self)
-    }
-    fn __frozen_hint() -> String {
-        frozen_mapping_hint::<K, V>()
-    }
 }
 
 /// Accepts any `collections.abc.Mapping` (`dict`, `types.MappingProxyType`,
@@ -941,24 +668,12 @@ where
         })?;
         Ok(out)
     }
-    fn input_hint() -> String {
-        mapping_input_hint::<K, V>()
-    }
 }
 
 /// Becomes a new `dict` (in key order).
 impl<K: IntoObject, V: IntoObject> IntoObject for BTreeMap<K, V> {
     fn into_object(self) -> Result<Object> {
         dict_from_pairs(self)
-    }
-    fn output_hint() -> String {
-        format!("dict[{}, {}]", K::output_hint(), V::output_hint())
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        frozen_mapping(self)
-    }
-    fn __frozen_hint() -> String {
-        frozen_mapping_hint::<K, V>()
     }
 }
 
@@ -972,24 +687,12 @@ impl<K: FromObject + Ord, V: FromObject> FromObject for BTreeMap<K, V> {
         })?;
         Ok(out)
     }
-    fn input_hint() -> String {
-        mapping_input_hint::<K, V>()
-    }
 }
 
 /// Becomes a new `set`.
 impl<T: IntoObject, S> IntoObject for HashSet<T, S> {
     fn into_object(self) -> Result<Object> {
         set_from_items(self)
-    }
-    fn output_hint() -> String {
-        format!("set[{}]", T::output_hint())
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        frozen_set(self)
-    }
-    fn __frozen_hint() -> String {
-        format!("frozenset[{}]", T::__frozen_hint())
     }
 }
 
@@ -1006,25 +709,12 @@ where
         })?;
         Ok(out)
     }
-    fn input_hint() -> String {
-        let t = T::input_hint();
-        format!("set[{t}] | frozenset[{t}]")
-    }
 }
 
 /// Becomes a new `set`.
 impl<T: IntoObject> IntoObject for BTreeSet<T> {
     fn into_object(self) -> Result<Object> {
         set_from_items(self)
-    }
-    fn output_hint() -> String {
-        format!("set[{}]", T::output_hint())
-    }
-    fn __into_frozen(self) -> Result<Object> {
-        frozen_set(self)
-    }
-    fn __frozen_hint() -> String {
-        format!("frozenset[{}]", T::__frozen_hint())
     }
 }
 
@@ -1036,10 +726,6 @@ impl<T: FromObject + Ord> FromObject for BTreeSet<T> {
             out.insert(v);
         })?;
         Ok(out)
-    }
-    fn input_hint() -> String {
-        let t = T::input_hint();
-        format!("set[{t}] | frozenset[{t}]")
     }
 }
 
@@ -1054,20 +740,6 @@ macro_rules! tuple_impls {
                     let items = [$(into_bound(py, self.$idx)?),+];
                     Ok(Object::from_bound(PyTuple::new(py, items)?.into_any()))
                 })
-            }
-            fn output_hint() -> String {
-                let parts: &[String] = &[$($name::output_hint()),+];
-                format!("tuple[{}]", parts.join(", "))
-            }
-            fn __into_frozen(self) -> Result<Object> {
-                attach(|py| {
-                    let items = [$(self.$idx.__into_frozen()?.into_py().into_bound(py)),+];
-                    Ok(Object::from_bound(PyTuple::new(py, items)?.into_any()))
-                })
-            }
-            fn __frozen_hint() -> String {
-                let parts: &[String] = &[$($name::__frozen_hint()),+];
-                format!("tuple[{}]", parts.join(", "))
             }
         }
 
@@ -1086,10 +758,6 @@ macro_rules! tuple_impls {
                     }
                     Ok(($(extract_bound::<$name>(&t.get_item($idx)?)?,)+))
                 })
-            }
-            fn input_hint() -> String {
-                let parts: &[String] = &[$($name::input_hint()),+];
-                format!("tuple[{}]", parts.join(", "))
             }
         }
     };

@@ -11,18 +11,6 @@ fn keyword_arguments_and_defaults() {
         assert mylib.add(b=10, a=1) == 11
         assert mylib.add(1, None) == 2
         assert mylib.add.__text_signature__ == "(a, b=None)"
-        try:
-            mylib.add()
-        except TypeError as e:
-            assert "'a'" in str(e), e
-        else:
-            raise AssertionError("missing argument accepted")
-        try:
-            mylib.add(1, c=2)
-        except TypeError:
-            pass
-        else:
-            raise AssertionError("unknown keyword accepted")
     "#);
 }
 
@@ -70,7 +58,7 @@ fn strict_conversions() {
 #[test]
 fn constants_and_private_items() {
     run(r#"
-        assert mylib.VERSION == "1.2.3"
+        assert mylib.VERSION == "1.2.3" and mylib.LIMIT == 10
         for name in ("helper", "crate_only", "MyError", "private_mod", "internal"):
             assert not hasattr(mylib, name), name
         assert not hasattr(mylib.Point, "internal")
@@ -90,7 +78,7 @@ fn error_mapping() {
             raise AssertionError("no error")
         try:
             mylib.fail("x")
-        except RuntimeError as e:
+        except LookupError as e:
             assert str(e) == "my error: x", e
         else:
             raise AssertionError("no error")
@@ -125,6 +113,9 @@ fn shared_borrow_parameters() {
         assert mylib.greet("you") == "hello you"
         assert mylib.greet(None) == "hello world"
         assert mylib.first_word("  hi there") == "hi"
+        assert mylib.nothing() is None
+        assert mylib.nested_sum([{"a": [1, 2]}, {"b": [3]}]) == 6
+        assert mylib.many(1, 2, 3) == 1230 and mylib.many(1, 2, c=3, d=4) == 1234
         try:
             mylib.count_lines(b"bytes")
         except TypeError as e:

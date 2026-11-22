@@ -45,6 +45,7 @@ mod demo {
     }
 
     impl Point {
+        /// Creates a point from its coordinates.
         pub fn new(x: f64, y: f64) -> Self {
             Point { x, y }
         }
@@ -53,10 +54,13 @@ mod demo {
             self.x.hypot(self.y)
         }
 
-        pub fn scale(&mut self, k: f64) -> &mut Self {
+        pub fn scale(&mut self, k: f64) {
             self.x *= k;
             self.y *= k;
-            self
+        }
+
+        pub fn dist(&self, other: &Point) -> f64 {
+            (self.x - other.x).hypot(self.y - other.y)
         }
     }
 
@@ -66,16 +70,14 @@ mod demo {
         }
     }
 
-    /// A value field next to a reference field.
+    /// A reference field next to a private value field.
     #[derive(Default)]
     pub struct Basket {
-        /// A value: Python reads an immutable snapshot (a tuple); assign to
-        /// replace it.
-        pub items: Vec<i64>,
-        /// Also a value: a read-only mapping of tuples.
-        pub table: HashMap<String, Vec<i64>>,
         /// A reference: a real Python list, mutable in place.
         pub tags: List<String>,
+        /// A simple value: copied in and out.
+        pub label: String,
+        items: Vec<i64>,
     }
 
     impl Basket {
@@ -87,18 +89,22 @@ mod demo {
             self.items.push(item);
         }
 
+        pub fn items(&self) -> Vec<i64> {
+            self.items.clone()
+        }
+
         pub fn count(&self) -> usize {
-            self.items.len() + self.table.values().map(Vec::len).sum::<usize>() + self.tags.len()
+            self.items.len() + self.tags.len()
         }
     }
 
-    pub enum Color {
-        Red,
-        Green,
+    /// No constructor: instances only come from Rust.
+    pub struct Ticket {
+        pub id: i64,
     }
 
-    pub fn favorite() -> Color {
-        Color::Red
+    pub fn ticket(id: i64) -> Ticket {
+        Ticket { id }
     }
 
     pub mod geometry {

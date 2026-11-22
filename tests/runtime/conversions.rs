@@ -130,7 +130,6 @@ fn none_and_option() -> Result<()> {
 #[test]
 fn boxes() -> Result<()> {
     assert_eq!(*round_trip(Box::new(5i64))?, 5);
-    assert_eq!(<Box<Vec<i64>> as FromObject>::input_hint(), "collections.abc.Sequence[int]");
     type_error::<Box<i64>>("'x'");
     Ok(())
 }
@@ -210,13 +209,6 @@ fn bytes() -> Result<()> {
     let l = List::from_vec(vec![1u8, 2])?;
     assert_eq!(l.as_object().type_name(), "list");
 
-    assert_eq!(<Vec<u8> as IntoObject>::output_hint(), "bytes");
-    assert_eq!(<[u8; 4] as IntoObject>::output_hint(), "bytes");
-    assert_eq!(
-        <Vec<u8> as FromObject>::input_hint(),
-        "bytes | bytearray | collections.abc.Sequence[int]"
-    );
-    assert_eq!(<Vec<Vec<u8>> as IntoObject>::output_hint(), "list[bytes]");
     Ok(())
 }
 
@@ -229,7 +221,6 @@ fn arrays() -> Result<()> {
         type_error::<[i64; 2]>("[1, 2, 3]"),
         "expected a sequence of length 2, got length 3"
     );
-    assert_eq!(<[f64; 3] as FromObject>::input_hint(), "collections.abc.Sequence[float]");
     Ok(())
 }
 
@@ -249,9 +240,6 @@ fn paths() -> Result<()> {
     assert_eq!(type_error::<PathBuf>("1"), "expected str or os.PathLike, got int");
     type_error::<PathBuf>("b'bytes'");
 
-    assert_eq!(<PathBuf as FromObject>::input_hint(), "str | os.PathLike[str]");
-    assert_eq!(<PathBuf as IntoObject>::output_hint(), "pathlib.Path");
-    assert_eq!(<&Path as IntoObject>::output_hint(), "pathlib.Path");
     Ok(())
 }
 
@@ -324,8 +312,6 @@ fn btree_collections() -> Result<()> {
     assert_eq!(obj.type_name(), "set");
     assert_eq!(obj.to::<BTreeSet<i64>>()?, s);
     assert_eq!(eval("frozenset([5])")?.to::<BTreeSet<i64>>()?, BTreeSet::from([5]));
-    assert_eq!(<BTreeMap<String, i64> as IntoObject>::output_hint(), "dict[str, int]");
-    assert_eq!(<BTreeSet<i64> as FromObject>::input_hint(), "set[int] | frozenset[int]");
     Ok(())
 }
 
@@ -402,44 +388,7 @@ fn result_into_object() -> Result<()> {
     assert!(io.into_object().unwrap_err().is_instance_of("FileNotFoundError"));
     let parsed: std::result::Result<i64, std::num::ParseIntError> = "5".parse();
     assert_eq!(parsed.into_object()?.to::<i64>()?, 5);
-    assert_eq!(<std::result::Result<String, std::fmt::Error> as IntoObject>::output_hint(), "str");
     Ok(())
-}
-
-#[test]
-fn type_hints() {
-    assert_eq!(<i64 as FromObject>::input_hint(), "int");
-    assert_eq!(<u8 as IntoObject>::output_hint(), "int");
-    assert_eq!(<f32 as FromObject>::input_hint(), "float");
-    assert_eq!(<bool as IntoObject>::output_hint(), "bool");
-    assert_eq!(<String as FromObject>::input_hint(), "str");
-    assert_eq!(<&str as IntoObject>::output_hint(), "str");
-    assert_eq!(<Cow<'_, str> as IntoObject>::output_hint(), "str");
-    assert_eq!(<() as IntoObject>::output_hint(), "None");
-    assert_eq!(<Object as FromObject>::input_hint(), "typing.Any");
-    assert_eq!(<Option<i64> as FromObject>::input_hint(), "int | None");
-    assert_eq!(<Option<()> as FromObject>::input_hint(), "None");
-    assert_eq!(<Option<()> as IntoObject>::output_hint(), "None");
-    assert_eq!(<Option<Option<i64>> as FromObject>::input_hint(), "int | None");
-    assert_eq!(<Vec<i64> as IntoObject>::output_hint(), "list[int]");
-    assert_eq!(<Vec<i64> as FromObject>::input_hint(), "collections.abc.Sequence[int]");
-    assert_eq!(<HashMap<String, f64> as IntoObject>::output_hint(), "dict[str, float]");
-    assert_eq!(
-        <BTreeMap<String, f64> as FromObject>::input_hint(),
-        "collections.abc.Mapping[str, float]"
-    );
-    // Keys read back as `pathlib.Path`; `Mapping` is invariant in its keys.
-    assert_eq!(
-        <HashMap<PathBuf, i64> as FromObject>::input_hint(),
-        "collections.abc.Mapping[str | os.PathLike[str], int]"
-    );
-    assert_eq!(<HashSet<i64> as IntoObject>::output_hint(), "set[int]");
-    assert_eq!(<HashSet<i64> as FromObject>::input_hint(), "set[int] | frozenset[int]");
-    assert_eq!(<(i64, String) as FromObject>::input_hint(), "tuple[int, str]");
-    assert_eq!(<Result<Vec<Object>> as IntoObject>::output_hint(), "list[typing.Any]");
-    assert_eq!(<List<i64> as FromObject>::input_hint(), "list[int]");
-    assert_eq!(<Dict<String, List<f64>> as IntoObject>::output_hint(), "dict[str, list[float]]");
-    assert_eq!(<Set<String> as FromObject>::input_hint(), "set[str]");
 }
 
 #[test]
@@ -453,21 +402,14 @@ fn user_impls() -> Result<()> {
         fn into_object(self) -> Result<Object> {
             (self.x, self.y).into_object()
         }
-        fn output_hint() -> String {
-            "tuple[float, float]".into()
-        }
     }
     impl FromObject for Point {
         fn from_object(obj: &Object) -> Result<Self> {
             let (x, y) = obj.to()?;
             Ok(Point { x, y })
         }
-        fn input_hint() -> String {
-            "tuple[float, float]".into()
-        }
     }
     let p = Point { x: 1.0, y: 2.0 };
     assert_eq!(round_trip(vec![p])?, [Point { x: 1.0, y: 2.0 }]);
-    assert_eq!(<Vec<Point> as FromObject>::input_hint(), "collections.abc.Sequence[tuple[float, float]]");
     Ok(())
 }

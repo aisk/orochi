@@ -1,5 +1,5 @@
-//! Classes: construction, fields, methods, special methods, borrowing and
-//! `Ref<T>` identity.
+//! Classes: construction, methods, special methods, borrowing and `Ref<T>`
+//! identity.
 
 use orochi::Ref;
 
@@ -10,56 +10,60 @@ fn construction_methods_and_properties() {
     run(r#"
         P = mylib.Point
         p = P(3, 4)
+        assert type(p) is P and isinstance(p, P)
         assert p.norm() == 5.0
         assert P(x=1, y=2).x == 1.0
-        assert P.__text_signature__ == "(x, y)", P.__text_signature__
         p.x = 6
         assert p.x == 6.0 and isinstance(p.x, float)
-        p.scale(0.5)
+        assert p.scale(0.5) is None
         assert (p.x, p.y) == (3.0, 2.0)
         o = P.origin()
-        assert (o.x, o.y) == (0.0, 0.0)
+        assert (o.x, o.y) == (0.0, 0.0) and type(o) is P
+        assert p.origin().x == 0.0         # static methods work on instances too
         assert p.dist(P(3, 0)) == 2.0
         assert p.dist(other=P(3, 0)) == 2.0
+        assert P.dist(p, P(3, 0)) == 2.0   # unbound call
         assert P.DIMENSIONS == 2
-        q = p.swapped()
-        assert (q.x, q.y) == (2.0, 3.0) and (p.x, p.y) == (3.0, 2.0)
+        assert type(P.UNIT) is P and P.UNIT.x == 1.0
         assert p.cached_norm() == p.norm()
-        try:
-            p.x = "no"
-        except TypeError as e:
-            assert str(e).startswith("attribute 'x': expected float"), e
-        else:
-            raise AssertionError("str accepted for float field")
-        try:
-            del p.x
-        except (AttributeError, TypeError):
-            pass
-        else:
-            raise AssertionError("field deleted")
         try:
             P(True, 1)
         except TypeError as e:
-            assert "argument 'x'" in str(e)
+            assert str(e).startswith("argument 'x': expected float, got bool"), e
         else:
             raise AssertionError("bool accepted")
+        try:
+            p.checked_scale(0)
+        except ValueError as e:
+            assert str(e) == "k must not be zero"
+        else:
+            raise AssertionError("no error")
     "#);
 }
 
 #[test]
-fn method_chaining_returns_self() {
+fn class_return_values() {
     run(r#"
-        p = mylib.Point(1, 1)
-        r = p.scale(2).scale(3)
-        assert r is p
-        assert (p.x, p.y) == (6.0, 6.0)
-        assert p.checked_scale(2) is p
+        P = mylib.Point
+        assert type(mylib.maybe_point(True)) is P
+        assert mylib.maybe_point(False) is None
+        assert mylib.parse_point("1, 2") == P(1, 2)
         try:
-            p.checked_scale(0)
-        except ValueError:
-            pass
+            mylib.parse_point("x")
+        except ValueError as e:
+            assert "not a point" in str(e)
         else:
             raise AssertionError("no error")
+        t = mylib.token(5)
+        assert type(t).__name__ == "Token" and t.id == 5
+        try:
+            mylib.Token(1)
+        except TypeError as e:
+            assert str(e) == "cannot create 'mylib.Token' instances", e
+        else:
+            raise AssertionError("class without `new` constructed")
+        s = mylib.unit_square()
+        assert type(s) is mylib.geometry.Square and s.side == 1.0
     "#);
 }
 
@@ -71,6 +75,7 @@ fn special_methods() {
         assert p == P(6, 4)
         assert p != P(6, 5)
         assert (p == 3) is False
+        assert p.__eq__(3) is NotImplemented
         assert repr(p) == "Point { x: 6.0, y: 4.0, cache: None }", repr(p)
         assert str(p) == "(6, 4)", str(p)
         try:
@@ -94,6 +99,8 @@ fn special_methods() {
         c = mylib.Counter()
         assert c == c and c != mylib.Counter()
         hash(c)
+        # No Debug: the default repr.
+        assert repr(c).startswith("<mylib.Counter object at"), repr(c)
     "#);
 }
 
@@ -109,15 +116,51 @@ fn class_parameters_borrow_the_instance() {
         assert mylib.incr_counter(c) == 1
         assert mylib.incr_counter(c) == 2
         assert c.count == 2 and mylib.read_counter(c) == 2
-
-        # By value is a copy (Point is Clone); Counter is not Clone, so it can
-        # only be passed by reference.
         try:
             mylib.incr_counter(a)
         except TypeError as e:
-            assert "expected mylib.Counter, got Point" in str(e), e
+            assert str(e) == "argument 'c': expected Counter, got Point", e
         else:
             raise AssertionError("wrong class accepted")
+
+        assert mylib.x_or_zero() == 0.0 and mylib.x_or_zero(None) == 0.0
+        assert mylib.x_or_zero(a) == 1.0
+        try:
+            mylib.x_or_zero(1)
+        except TypeError as e:
+            assert str(e) == "argument 'p': expected Point, got int", e
+        else:
+            raise AssertionError("int accepted")
+    "#);
+}
+
+#[test]
+fn class_by_value_is_a_copy() {
+    run(r#"
+        p = mylib.Point(1, 2)
+        q = mylib.mirrored(p)
+        assert (q.x, p.x) == (-1.0, 1.0) and q is not p
+        s = p.swapped()
+        assert (s.x, s.y) == (2.0, 1.0) and (p.x, p.y) == (1.0, 2.0)
+    "#);
+}
+
+#[test]
+fn ref_parameters_and_returns_keep_identity() {
+    run(r#"
+        p = mylib.Point(1, 2)
+        assert mylib.same(p) is p
+        far, near = mylib.Point(9, 9), mylib.Point(1, 3)
+        assert p.nearest([far, near]) is near
+        assert p.nearest([]) is None
+        c = mylib.geometry.centroid([mylib.Point(0, 0), mylib.Point(2, 4)])
+        assert c == mylib.Point(1, 2)
+        try:
+            mylib.same(1)
+        except TypeError as e:
+            assert str(e).startswith("argument 'p': expected Point, got int"), e
+        else:
+            raise AssertionError("int accepted for Ref<Point>")
     "#);
 }
 
@@ -127,7 +170,7 @@ fn borrow_conflicts_raise() {
         p = mylib.Point(1, 1)
         assert p.dist(p) == 0.0       # two shared borrows are fine
         try:
-            p.absorb(p)                # &mut self + &Point on the same object
+            p.absorb(p)                # &mut self + &Self on the same object
         except RuntimeError as e:
             assert "borrow" in str(e).lower(), e
         else:
@@ -141,6 +184,8 @@ fn borrow_conflicts_raise() {
         assert (p.x, p.y) == (1.0, 1.0)
         p.absorb(mylib.Point(1, 1))
         assert p.x == 2.0
+        # `&self` and `Ref::borrow` of the same instance are both shared.
+        assert p.nearest([p]) is p
     "#);
 }
 
@@ -159,7 +204,7 @@ fn ref_fields_share_identity() {
         try:
             c.center = 1
         except TypeError as e:
-            assert "expected mylib.Point" in str(e), e
+            assert str(e).startswith("attribute 'center': expected Point, got int"), e
         else:
             raise AssertionError("int accepted for Ref<Point>")
     "#);
@@ -180,41 +225,15 @@ fn ref_from_rust() {
     let guard = p.borrow_mut().unwrap();
     let err = s.exec("p.x").unwrap_err();
     assert!(err.is_instance_of("RuntimeError"), "{err}");
+    let err = s.exec("p.norm()").unwrap_err();
+    assert!(err.is_instance_of("RuntimeError"), "{err}");
     assert!(p.borrow().is_err());
     drop(guard);
     s.exec("assert p.x == 1.0").unwrap();
 
-    // Conversions: a Ref comes back from Python as the same object; a
-    // by-value class is a copy.
+    // A Ref comes back from Python as the same object.
     let back: Ref<mylib::Point> = s.get("p").unwrap().to().unwrap();
     assert!(back.is(&p));
-    let copy: mylib::Point = s.get("p").unwrap().to().unwrap();
-    assert_eq!(copy, mylib::Point::new(1.0, 7.0));
+    assert_eq!(*back.borrow().unwrap(), mylib::Point::new(1.0, 7.0));
     assert!(s.get("c").unwrap().to::<Ref<mylib::Point>>().is_err());
-}
-
-#[test]
-fn enums() {
-    run(r#"
-        C = mylib.Color
-        assert C.Red == C.Red and C.Red != C.Green
-        assert mylib.is_red(C.Red) and not mylib.is_red(C.Green)
-        assert repr(C.Green) == "Color.Green", repr(C.Green)
-        assert len({C.Red, C.Red, C.Green}) == 2
-    "#);
-}
-
-#[test]
-fn enum_members_are_cached_at_class_creation() {
-    // Conversions return the member objects read when the class was
-    // created, even if the class attribute is reassigned later.
-    run(r#"
-        calm = mylib.Mood.Calm
-        assert mylib.calm() is calm
-        mylib.Mood.Calm = "replaced"
-        try:
-            assert mylib.calm() is calm
-        finally:
-            mylib.Mood.Calm = calm
-    "#);
 }

@@ -1,4 +1,4 @@
-# Only for building a wheel with maturin (see the README, "Type stubs");
+# Only for building a wheel with maturin (`maturin build`);
 # run.ps1 does not need it.
 [build-system]
 requires = ["maturin>=1.9,<2"]
