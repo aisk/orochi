@@ -42,33 +42,7 @@ pub mod mylib {
         text.split_whitespace().next().unwrap_or("")
     }
 
-    pub fn push_twice(xs: &mut Vec<i64>, v: i64) {
-        xs.push(v);
-        xs.push(v);
-    }
-
-    /// Pushes `v`, then fails if the list is now longer than `limit`.
-    pub fn push_checked(xs: &mut Vec<i64>, v: i64, limit: usize) -> Result<()> {
-        xs.push(v);
-        if xs.len() > limit {
-            return Err(Error::value_error("too long"));
-        }
-        Ok(())
-    }
-
-    pub fn bump(counts: &mut HashMap<String, i64>, key: String) {
-        *counts.entry(key).or_insert(0) += 1;
-    }
-
-    pub fn sorted_insert(m: &mut BTreeMap<i64, String>, k: i64) {
-        m.insert(k, k.to_string());
-    }
-
-    pub fn add_tag(tags: &mut HashSet<String>, tag: &str) -> bool {
-        tags.insert(tag.to_owned())
-    }
-
-    /// The handle type: refers to the caller's list beyond a copy.
+    /// The handle type: refers to the caller's list itself.
     pub fn push_handle(xs: List<i64>, v: i64) -> Result<()> {
         xs.push(v)?;
         xs.push(v)
@@ -76,6 +50,14 @@ pub mod mylib {
 
     pub fn copy_back(xs: Vec<i64>) -> Vec<i64> {
         xs
+    }
+
+    pub fn nested_sum(rows: Vec<HashMap<String, Vec<i64>>>) -> i64 {
+        rows.iter().flat_map(|row| row.values()).flatten().sum()
+    }
+
+    pub fn nested_len(rows: &[HashMap<String, Vec<i64>>]) -> usize {
+        rows.iter().map(HashMap::len).sum()
     }
 
     #[allow(private_interfaces)]
@@ -107,38 +89,6 @@ pub mod mylib {
     /// A leading underscore must not trigger `non_snake_case` in generated code.
     pub fn _under() -> i64 {
         1
-    }
-
-    pub fn touch_vec(xs: &mut Vec<String>) {
-        let _ = xs;
-    }
-
-    pub fn touch_map(m: &mut HashMap<String, String>) {
-        let _ = m;
-    }
-
-    pub fn touch_set(s: &mut HashSet<String>) {
-        let _ = s;
-    }
-
-    pub fn set_value(m: &mut HashMap<String, String>, key: &str, value: &str) {
-        m.insert(key.to_owned(), value.to_owned());
-    }
-
-    pub fn remove_key(m: &mut BTreeMap<String, String>, key: &str) {
-        m.remove(key);
-    }
-
-    pub fn remove_elem(s: &mut HashSet<String>, elem: &str) {
-        s.remove(elem);
-    }
-
-    pub fn merge_into(dst: &mut Vec<i64>, src: &mut Vec<i64>) {
-        dst.append(src);
-    }
-
-    pub fn extend_from(dst: &mut Vec<i64>, src: &[i64]) {
-        dst.extend_from_slice(src);
     }
 
     #[allow(dead_code)]
@@ -409,18 +359,45 @@ pub mod mylib {
         }
     }
 
-    /// Container fields read as live views.
+    /// Returns its argument.
+    pub fn identity(x: Object) -> Object {
+        x
+    }
+
+    pub fn objects(xs: Vec<Object>) -> Vec<Object> {
+        xs
+    }
+
+    /// Fields of Rust value types read as immutable snapshots.
     #[derive(Default)]
     pub struct Bag {
         pub items: Vec<i64>,
         pub rows: Vec<Vec<i64>>,
         pub table: HashMap<String, Vec<i64>>,
-        pub counts: HashMap<String, i64>,
+        pub counts: BTreeMap<String, i64>,
         pub tags: BTreeSet<String>,
+        pub sets: HashSet<(i64, i64)>,
         pub maybe: Option<Vec<i64>>,
+        pub boxed: Option<Box<Vec<i64>>>,
         pub fixed: [i64; 2],
+        pub pair: (i64, Vec<i64>),
         pub data: Vec<u8>,
         pub label: String,
+        pub path: PathBuf,
+        /// References inside a value container stay references.
+        pub handles: Vec<List<i64>>,
+        pub objects: Vec<Object>,
+        pub points: Vec<Ref<Point>>,
+        pub refs: HashMap<String, Ref<Point>>,
+        pub maybe_list: Option<List<i64>>,
+        pub dicts: Vec<HashMap<String, i64>>,
+        pub opts: Vec<Option<i64>>,
+        pub blobs: Vec<Vec<u8>>,
+        pub by_path: HashMap<PathBuf, i64>,
+        /// Enum members are immutable singletons, so held by value.
+        pub color: Option<Color>,
+        pub colors: Vec<Color>,
+        pub palette: HashMap<String, Color>,
     }
 
     impl Bag {
@@ -432,77 +409,35 @@ pub mod mylib {
             self.items.iter().sum()
         }
 
-        pub fn row_len(&self, i: usize) -> usize {
-            self.rows[i].len()
-        }
-
-        pub fn table_len(&self, key: &str) -> Option<usize> {
-            self.table.get(key).map(Vec::len)
-        }
-
-        pub fn tag_list(&self) -> Vec<String> {
-            self.tags.iter().cloned().collect()
-        }
-
-        /// Calls `f` while `self` is mutably borrowed.
-        pub fn with_callback(&mut self, f: Object) -> Result<Object> {
-            f.call(())
+        pub fn push(&mut self, v: i64) {
+            self.items.push(v);
+            self.rows.push(vec![v]);
+            self.table.entry(v.to_string()).or_default().push(v);
+            self.tags.insert(v.to_string());
         }
     }
 
-    /// Field types whose views are decided by the Rust type, not by what
-    /// the value looks like in Python.
+    /// Fields of orochi reference types are the Python objects themselves.
     pub struct Shelf {
-        /// A handle: the referenced list itself.
-        pub handle: List<i64>,
-        /// Any object: returned as it is, even a list.
+        pub xs: List<i64>,
+        pub map: Dict<String, i64>,
+        pub members: Set<i64>,
         pub any: Object,
-        /// A fixed-size array: a plain list, whose `Vec` elements are views.
-        pub grid: [Vec<i64>; 2],
-        /// Elements that are arrays: plain lists.
-        pub pairs: Vec<[i64; 2]>,
-        pub boxed: Option<Box<Vec<i64>>>,
     }
 
     impl Shelf {
-        pub fn new(handle: List<i64>) -> Self {
+        pub fn new(xs: List<i64>) -> Self {
             Shelf {
-                handle,
+                xs,
+                map: Dict::new(),
+                members: Set::new(),
                 any: Object::none(),
-                grid: [Vec::new(), Vec::new()],
-                pairs: Vec::new(),
-                boxed: None,
             }
         }
-    }
 
-    /// Returns its argument.
-    pub fn identity(x: Object) -> Object {
-        x
-    }
-
-    pub fn objects(xs: Vec<Object>) -> Vec<Object> {
-        xs
-    }
-
-    /// `&mut` of an instance and of something inside it.
-    pub fn refill(bag: &mut Bag, xs: &mut Vec<i64>) {
-        bag.items.clear();
-        xs.push(1);
-    }
-
-    #[allow(clippy::ptr_arg)]
-    pub fn nest(rows: &mut Vec<Vec<i64>>, row: &mut Vec<i64>) {
-        rows.push(row.clone());
-    }
-
-    /// `&mut` containers are typed with the elements' output hints.
-    pub fn touch_nested(
-        table: &mut HashMap<String, Vec<i64>>,
-        blobs: &mut Vec<Vec<u8>>,
-        paths: &mut Vec<PathBuf>,
-    ) {
-        let _ = (table, blobs, paths);
+        pub fn sizes(&self) -> (usize, usize, usize) {
+            (self.xs.len(), self.map.len(), self.members.len())
+        }
     }
 
     /// Only used by the enum-member cache test.

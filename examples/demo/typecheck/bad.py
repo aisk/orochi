@@ -21,11 +21,11 @@ label: str = p.norm()  # expect: assignment
 key: typing.Hashable = p  # expect: assignment
 
 b = Basket()
-b.items.append(1)  # expect: arg-type
-copy: list[str] = b.items  # expect: assignment
-b.items = b.numbers  # expect: assignment
-b.table["k"].append("x")  # expect: arg-type
-demo.push_twice(b.items, 1)  # expect: arg-type
+b.items.append(1)  # expect: attr-defined
+copy: list[int] = b.items  # expect: assignment
+b.items = ["x"]  # expect: list-item
+b.table["k"] = [1]  # expect: index
+b.tags = b.items  # expect: assignment
 
 green: Color = Color.Green
 Color()  # expect: call-arg

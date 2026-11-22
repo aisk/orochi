@@ -135,93 +135,37 @@ fn shared_borrow_parameters() {
 }
 
 #[test]
-fn mut_vec_writes_back_in_place() {
+fn values_are_copies_and_handles_are_references() {
     run(r#"
-        xs = [1]
-        alias = xs
-        assert mylib.push_twice(xs, 5) is None
-        assert xs == [1, 5, 5], xs
-        assert xs is alias
-
-        # By value is a copy.
+        # By value is a copy, in both directions; the returned list is a new,
+        # mutable list owned by the caller.
         ys = [1]
-        assert mylib.copy_back(ys) == [1]
-        assert mylib.copy_back(ys) is not ys
+        out = mylib.copy_back(ys)
+        assert out == [1] and out is not ys and type(out) is list
+        out.append(2)
+        assert ys == [1]
 
-        # The handle type also works in place.
+        # A `List<i64>` parameter is the caller's list itself.
         zs = [0]
+        same = zs
         mylib.push_handle(zs, 2)
-        assert zs == [0, 2, 2]
-    "#);
-}
-
-#[test]
-fn mut_vec_writes_back_on_error() {
-    run(r#"
-        xs = [1, 2]
+        assert zs == [0, 2, 2] and zs is same
         try:
-            mylib.push_checked(xs, 3, limit=2)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("no error")
-        assert xs == [1, 2, 3], xs
-        mylib.push_checked(xs, 4, 10)
-        assert xs == [1, 2, 3, 4]
-    "#);
-}
-
-#[test]
-fn mut_vec_requires_a_list() {
-    run(r#"
-        for bad in ((1, 2), range(3), "ab"):
-            try:
-                mylib.push_twice(bad, 1)
-            except TypeError as e:
-                assert str(e).startswith("argument 'xs': expected list"), e
-            else:
-                raise AssertionError(f"{bad!r} accepted")
-        try:
-            mylib.push_twice(["a"], 1)
+            mylib.push_handle((0,), 1)
         except TypeError as e:
-            assert "argument 'xs'" in str(e), e
+            assert str(e).startswith("argument 'xs': expected list"), e
         else:
-            raise AssertionError("bad element accepted")
-    "#);
-}
+            raise AssertionError("tuple accepted as a List")
 
-#[test]
-fn mut_maps_and_sets_write_back_in_place() {
-    run(r#"
-        d = {"a": 1}
-        alias = d
-        mylib.bump(d, "a")
-        mylib.bump(d, "b")
-        assert d == {"a": 2, "b": 1} and d is alias
-
-        m = {3: "3"}
-        mylib.sorted_insert(m, 1)
-        assert m == {1: "1", 3: "3"}
-
-        s = {"x"}
-        alias = s
-        assert mylib.add_tag(s, "y") is True
-        assert mylib.add_tag(s, "y") is False
-        assert s == {"x", "y"} and s is alias
-
-        for bad in (frozenset(), [], {}):
-            try:
-                mylib.add_tag(bad, "z")
-            except TypeError as e:
-                assert "expected set" in str(e), e
-            else:
-                raise AssertionError(f"{bad!r} accepted")
+        # Maps convert from any mapping; sets from a set or frozenset.
+        import types
+        assert mylib.lookup(types.MappingProxyType({"a": 1}), "a") == 1
         try:
-            mylib.bump([], "a")
+            mylib.lookup([("a", 1)], "a")
         except TypeError as e:
-            assert "expected dict" in str(e), e
+            assert str(e).startswith("argument 'map': expected a mapping, got list"), e
         else:
-            raise AssertionError("list accepted as dict")
+            raise AssertionError("list accepted as a mapping")
     "#);
 }
 
@@ -243,9 +187,7 @@ fn items_remain_rust_callable() {
     assert_eq!(mylib::add(1, None), 2);
     assert_eq!(mylib::add(1, Some(2)), 3);
     assert_eq!(mylib::count_lines("a\nb"), 2);
-    let mut xs = vec![1];
-    mylib::push_twice(&mut xs, 3);
-    assert_eq!(xs, [1, 3, 3]);
+    assert_eq!(mylib::copy_back(vec![1, 3]), [1, 3]);
     assert_eq!(mylib::geometry::area(0.0), 0.0);
     assert_eq!(mylib::crate_only(), 7);
     let p = mylib::Point::new(3.0, 4.0);

@@ -263,9 +263,39 @@ fn maps_and_sets() -> Result<()> {
     let obj = m.clone().into_object()?;
     assert_eq!(obj.type_name(), "dict");
     assert_eq!(obj.to::<HashMap<String, f64>>()?, m);
-    type_error::<HashMap<String, i64>>("[('a', 1)]");
+    assert_eq!(
+        type_error::<HashMap<String, i64>>("[('a', 1)]"),
+        "expected a mapping, got list"
+    );
+    // Any `collections.abc.Mapping` converts, not only a `dict`.
+    let proxy = eval("__import__('types').MappingProxyType({'a': 1.5, 'b': 2.0})")?;
+    assert_eq!(proxy.to::<HashMap<String, f64>>()?, m);
     type_error::<HashMap<String, i64>>("{'a': 1.5}");
     type_error::<HashMap<i64, i64>>("{'a': 1}");
+    // `dict` subclasses are read from the dict itself, not an overridden
+    // `items()`; other mappings through `items()`, whose entries must be
+    // pairs.
+    let scope = exec(
+        "import collections\n\
+         class Liar(dict):\n    def items(self): return [('x', 99)]\n\
+         class Odd(collections.abc.Mapping):\n\
+         \x20   def __init__(self, items): self._items = items\n\
+         \x20   def __getitem__(self, k): raise KeyError(k)\n\
+         \x20   def __iter__(self): return iter(())\n\
+         \x20   def __len__(self): return 0\n\
+         \x20   def items(self): return self._items\n",
+    )?;
+    let a1 = HashMap::from([("a".to_owned(), 1i64)]);
+    let map = |expr: &str| scope.eval(expr)?.to::<HashMap<String, i64>>();
+    assert_eq!(map("collections.OrderedDict(a=1)")?, a1);
+    assert_eq!(map("collections.UserDict(a=1)")?, a1);
+    assert_eq!(map("Liar(a=1)")?, a1);
+    assert_eq!(map("Odd([('a', 1)])")?, a1);
+    for bad in ["Odd([('a', 1, 2)])", "Odd(['ab'])", "Odd([['a', 1]])"] {
+        let err = map(bad).unwrap_err();
+        assert!(err.is_instance_of("TypeError"), "{err}");
+        assert!(err.message().starts_with("expected a (key, value) tuple, got "), "{err}");
+    }
 
     let s: HashSet<i64> = [1, 2, 3].into_iter().collect();
     let obj = s.clone().into_object()?;
@@ -394,6 +424,16 @@ fn type_hints() {
     assert_eq!(<Vec<i64> as IntoObject>::output_hint(), "list[int]");
     assert_eq!(<Vec<i64> as FromObject>::input_hint(), "collections.abc.Sequence[int]");
     assert_eq!(<HashMap<String, f64> as IntoObject>::output_hint(), "dict[str, float]");
+    assert_eq!(
+        <BTreeMap<String, f64> as FromObject>::input_hint(),
+        "collections.abc.Mapping[str, float]"
+    );
+    // Keys read back as `pathlib.Path`; `Mapping` is invariant in its keys.
+    assert_eq!(
+        <HashMap<PathBuf, i64> as FromObject>::input_hint(),
+        "collections.abc.Mapping[str | os.PathLike[str], int] \
+         | collections.abc.Mapping[pathlib.Path, int]"
+    );
     assert_eq!(<HashSet<i64> as IntoObject>::output_hint(), "set[int]");
     assert_eq!(<HashSet<i64> as FromObject>::input_hint(), "set[int] | frozenset[int]");
     assert_eq!(<(i64, String) as FromObject>::input_hint(), "tuple[int, str]");
@@ -401,31 +441,6 @@ fn type_hints() {
     assert_eq!(<List<i64> as FromObject>::input_hint(), "list[int]");
     assert_eq!(<Dict<String, List<f64>> as IntoObject>::output_hint(), "dict[str, list[float]]");
     assert_eq!(<Set<String> as FromObject>::input_hint(), "set[str]");
-}
-
-#[test]
-fn references_python_flag() {
-    const {
-        assert!(!<i64 as FromObject>::REFERENCES_PYTHON);
-        assert!(!<u8 as FromObject>::REFERENCES_PYTHON);
-        assert!(!<f32 as FromObject>::REFERENCES_PYTHON);
-        assert!(!<String as FromObject>::REFERENCES_PYTHON);
-        assert!(!<Cow<'static, str> as FromObject>::REFERENCES_PYTHON);
-        assert!(!<PathBuf as FromObject>::REFERENCES_PYTHON);
-        assert!(!<Vec<HashMap<String, f64>> as FromObject>::REFERENCES_PYTHON);
-        assert!(!<BTreeMap<String, BTreeSet<i64>> as FromObject>::REFERENCES_PYTHON);
-        assert!(!<[u8; 4] as FromObject>::REFERENCES_PYTHON);
-        assert!(!<Box<i64> as FromObject>::REFERENCES_PYTHON);
-        assert!(!<(i64, Option<bool>) as FromObject>::REFERENCES_PYTHON);
-        assert!(<Object as FromObject>::REFERENCES_PYTHON);
-        assert!(<List<i64> as FromObject>::REFERENCES_PYTHON);
-        assert!(<Dict<String, i64> as FromObject>::REFERENCES_PYTHON);
-        assert!(<Set<i64> as FromObject>::REFERENCES_PYTHON);
-        assert!(<Vec<Object> as FromObject>::REFERENCES_PYTHON);
-        assert!(<Option<List<i64>> as FromObject>::REFERENCES_PYTHON);
-        assert!(<(i64, Object) as FromObject>::REFERENCES_PYTHON);
-        assert!(<HashMap<String, Object> as FromObject>::REFERENCES_PYTHON);
-    }
 }
 
 #[test]
@@ -443,7 +458,6 @@ fn user_impls() -> Result<()> {
             "tuple[float, float]".into()
         }
     }
-    // No REFERENCES_PYTHON given: the conservative default applies.
     impl FromObject for Point {
         fn from_object(obj: &Object) -> Result<Self> {
             let (x, y) = obj.to()?;
@@ -453,7 +467,6 @@ fn user_impls() -> Result<()> {
             "tuple[float, float]".into()
         }
     }
-    const { assert!(<Point as FromObject>::REFERENCES_PYTHON) };
     let p = Point { x: 1.0, y: 2.0 };
     assert_eq!(round_trip(vec![p])?, [Point { x: 1.0, y: 2.0 }]);
     assert_eq!(<Vec<Point> as FromObject>::input_hint(), "collections.abc.Sequence[tuple[float, float]]");

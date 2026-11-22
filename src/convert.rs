@@ -22,7 +22,7 @@
 //! | `Option<T>` | `T` or `None` | `T` or `None` |
 //! | `Vec<T>`, `&[T]`, `[T; N]` | `list` | any sequence except `str`, `bytes`, `bytearray`, `memoryview` |
 //! | `Vec<u8>`, `&[u8]`, `[u8; N]` | `bytes` | `bytes`, `bytearray`, or a sequence of ints |
-//! | `HashMap`, `BTreeMap` | `dict` | `dict` |
+//! | `HashMap`, `BTreeMap` | `dict` | any `collections.abc.Mapping` |
 //! | `HashSet`, `BTreeSet` | `set` | `set` or `frozenset` |
 //! | tuples (1 to 12) | `tuple` | `tuple` of the same length |
 //! | `PathBuf`, `&Path` | `pathlib.Path` | `str` or `os.PathLike` |
@@ -44,8 +44,8 @@ use std::path::{Path, PathBuf};
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
-    PySequence, PySet, PyString, PyTuple,
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMapping,
+    PyMemoryView, PySequence, PySet, PyString, PyTuple,
 };
 
 use crate::error::{Error, Result};
@@ -56,6 +56,12 @@ use crate::runtime::attach;
 ///
 /// Implement this for your own types by building the object with orochi's
 /// API, e.g. returning a `dict` or calling a Python class.
+///
+/// A `pub` field of such a type is read through the same conversion, so the
+/// object is handed over exactly as built: unlike orochi's own containers it
+/// is not made immutable. Return an immutable object (a `tuple`, `bytes`,
+/// ...) or an orochi reference if changing it from Python must not be
+/// silently lost.
 ///
 /// ```
 /// use orochi::{IntoObject, Object};
@@ -90,123 +96,63 @@ pub trait IntoObject {
     where
         Self: Sized;
 
-    /// Converts a `Vec<Self>`. Overridden by `u8` to produce `bytes`.
+    /// Converts a `Vec<Self>`: a `list`, or with `frozen` a `tuple` of
+    /// frozen elements (see [`__into_frozen`](IntoObject::__into_frozen)).
+    /// Overridden by `u8` to produce `bytes`.
     #[doc(hidden)]
-    fn __vec_into_object(items: Vec<Self>) -> Result<Object>
+    fn __vec_into_object(items: Vec<Self>, frozen: bool) -> Result<Object>
     where
         Self: Sized,
     {
         attach(|py| {
-            let list = PyList::empty(py);
-            for item in items {
-                list.append(into_bound(py, item)?)?;
-            }
-            Ok(Object::from_bound(list.into_any()))
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let object = if frozen { item.__into_frozen() } else { item.into_object() };
+                    Ok(object?.into_py().into_bound(py))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Object::from_bound(if frozen {
+                PyTuple::new(py, items)?.into_any()
+            } else {
+                PyList::new(py, items)?.into_any()
+            }))
         })
     }
 
-    /// Hint for `Vec<Self>`.
+    /// Hint for [`__vec_into_object`](IntoObject::__vec_into_object).
     #[doc(hidden)]
-    fn __vec_output_hint() -> String
+    fn __vec_output_hint(frozen: bool) -> String
     where
         Self: Sized,
     {
-        format!("list[{}]", Self::output_hint())
-    }
-
-    /// Which positions of a value of this type are read as live views when
-    /// it is a class field (see [`ViewShape`]).
-    #[doc(hidden)]
-    fn __shape() -> ViewShape
-    where
-        Self: Sized,
-    {
-        ViewShape::Plain
-    }
-
-    /// [`__shape`](IntoObject::__shape) of `Vec<Self>`. Overridden by `u8`
-    /// (`bytes` are not viewed).
-    #[doc(hidden)]
-    fn __vec_shape() -> ViewShape
-    where
-        Self: Sized,
-    {
-        ViewShape::List(Box::new(Self::__shape()))
-    }
-
-    /// Hint for a value read where [`__shape`](IntoObject::__shape) says:
-    /// containers are views themselves (`list` -> `ListView`), anything
-    /// else is what [`output_hint`](IntoObject::output_hint) says. The view
-    /// classes are spelled `_orochi.ListView` etc.; the stub renderer
-    /// defines them.
-    #[doc(hidden)]
-    fn __view_hint() -> String
-    where
-        Self: Sized,
-    {
-        Self::output_hint()
-    }
-
-    /// [`__view_hint`](IntoObject::__view_hint) of `Vec<Self>`. Overridden
-    /// by `u8` (`bytes` are not viewed).
-    #[doc(hidden)]
-    fn __vec_view_hint() -> String
-    where
-        Self: Sized,
-    {
-        format!(
-            "_orochi.ListView[{}, {}, {}]",
-            Self::__view_hint(),
-            Self::__input_hint(),
-            Self::output_hint()
-        )
-    }
-
-    /// What a view accepts as a new element of this type: the
-    /// [`FromObject::input_hint`] of the type, for the types that implement
-    /// both traits (only output hints are reachable from here, so this
-    /// defaults to the output hint, which is narrower but correct).
-    #[doc(hidden)]
-    fn __input_hint() -> String
-    where
-        Self: Sized,
-    {
-        Self::output_hint()
-    }
-
-    /// [`__input_hint`](IntoObject::__input_hint) of `Vec<Self>`.
-    #[doc(hidden)]
-    fn __vec_input_hint_into() -> String
-    where
-        Self: Sized,
-    {
-        format!("collections.abc.Sequence[{}]", Self::__input_hint())
-    }
-}
-
-/// The positions of a class field that are read as live views: a `Vec` is a
-/// `ListView` (of elements of the inner shape), a map a `DictView` (values
-/// of the inner shape), a set a `SetView`; a fixed-size array is a plain
-/// `list` whose elements have the inner shape; `Option` and `Box` are
-/// transparent; anything else (numbers, strings, tuples, `bytes`, `Object`,
-/// handles, `Ref`, custom types) is returned as it is.
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ViewShape {
-    Plain,
-    List(Box<ViewShape>),
-    Dict(Box<ViewShape>),
-    Set,
-    Array(Box<ViewShape>),
-}
-
-impl ViewShape {
-    /// An array of elements of shape `inner` (plain if the elements are).
-    pub(crate) fn array(inner: ViewShape) -> ViewShape {
-        match inner {
-            ViewShape::Plain => ViewShape::Plain,
-            inner => ViewShape::Array(Box::new(inner)),
+        if frozen {
+            format!("tuple[{}, ...]", Self::__frozen_hint())
+        } else {
+            format!("list[{}]", Self::output_hint())
         }
+    }
+
+    /// Converts the value of a class field: Rust containers become immutable
+    /// snapshots, deeply (`tuple`, `frozenset`, `types.MappingProxyType`), so
+    /// that changing what Python reads cannot silently change only a copy.
+    /// Anything else (scalars, strings, `Object`, handles, `Ref`, custom
+    /// conversions) converts with [`into_object`](IntoObject::into_object).
+    #[doc(hidden)]
+    fn __into_frozen(self) -> Result<Object>
+    where
+        Self: Sized,
+    {
+        self.into_object()
+    }
+
+    /// Hint for [`__into_frozen`](IntoObject::__into_frozen).
+    #[doc(hidden)]
+    fn __frozen_hint() -> String
+    where
+        Self: Sized,
+    {
+        Self::output_hint()
     }
 }
 
@@ -218,7 +164,6 @@ impl ViewShape {
 /// struct Celsius(f64);
 ///
 /// impl FromObject for Celsius {
-///     const REFERENCES_PYTHON: bool = false; // optional, see below
 ///     fn from_object(obj: &Object) -> orochi::Result<Self> {
 ///         Ok(Celsius(obj.to::<f64>()?))
 ///     }
@@ -241,15 +186,6 @@ impl ViewShape {
             `Ref<{Self}>` to use the caller's instance itself"
 )]
 pub trait FromObject: Sized {
-    /// Whether a converted value may still refer to live Python objects.
-    ///
-    /// `false` for owned copies (`i64`, `String`, `Vec<f64>`, ...), `true`
-    /// for [`Object`], the typed handles, and containers of them. A function
-    /// whose arguments all have `REFERENCES_PYTHON == false` can run without
-    /// holding the interpreter. Defaults to the conservative `true`; set it
-    /// to `false` only if the value holds no Python references.
-    const REFERENCES_PYTHON: bool = true;
-
     /// Performs the conversion. Fails with `TypeError` if the object has the
     /// wrong type, or with the error Python raised (e.g. `OverflowError`).
     fn from_object(obj: &Object) -> Result<Self>;
@@ -269,11 +205,16 @@ pub trait FromObject: Sized {
         format!("collections.abc.Sequence[{}]", Self::input_hint())
     }
 
-    /// For the handle types (`List`, `Dict`, `Set`): the builtin they refer
-    /// to. A live view of a field is not that builtin, so passing one is an
-    /// error instead of a silently detached copy.
+    /// What Python reads back for this type (from a field), when that is
+    /// typed differently from [`input_hint`](FromObject::input_hint):
+    /// `pathlib.Path` for paths. Used for `Mapping` keys, which are invariant.
     #[doc(hidden)]
-    const __HANDLE_OF: Option<&'static str> = None;
+    fn __read_back_hint() -> Option<String>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// Builds the standard "wrong type" error.
@@ -284,11 +225,6 @@ pub(crate) fn type_mismatch(expected: &str, obj: &Bound<'_, PyAny>) -> Error {
         .map(|n| n.to_string())
         .unwrap_or_else(|_| "<unknown>".to_owned());
     Error::type_error(format!("expected {expected}, got {got}"))
-}
-
-/// [`type_mismatch`] for an [`Object`].
-pub(crate) fn type_mismatch_object(expected: &str, obj: &Object) -> Error {
-    attach(|py| type_mismatch(expected, obj.bind(py)))
 }
 
 /// Converts a borrowed pyo3 object with `T`'s `FromObject` implementation.
@@ -310,7 +246,7 @@ pub(crate) fn snapshot<'py>(obj: &Bound<'py, PyAny>) -> Result<Bound<'py, PyList
 }
 
 /// `T | None`, without repeating `None`.
-fn optional_hint(hint: String) -> String {
+pub fn optional_hint(hint: String) -> String {
     if hint.split(" | ").any(|part| part == "None") { hint } else { format!("{hint} | None") }
 }
 
@@ -412,7 +348,6 @@ impl IntoObject for &Object {
 }
 
 impl FromObject for Object {
-    const REFERENCES_PYTHON: bool = true;
     fn from_object(obj: &Object) -> Result<Self> {
         Ok(obj.clone())
     }
@@ -440,21 +375,16 @@ impl<T: IntoObject> IntoObject for Box<T> {
     fn output_hint() -> String {
         T::output_hint()
     }
-    fn __shape() -> ViewShape {
-        T::__shape()
+    fn __into_frozen(self) -> Result<Object> {
+        (*self).__into_frozen()
     }
-    fn __view_hint() -> String {
-        T::__view_hint()
-    }
-    fn __input_hint() -> String {
-        T::__input_hint()
+    fn __frozen_hint() -> String {
+        T::__frozen_hint()
     }
 }
 
 /// Converts like `T`.
 impl<T: FromObject> FromObject for Box<T> {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
-    const __HANDLE_OF: Option<&'static str> = T::__HANDLE_OF;
     fn from_object(obj: &Object) -> Result<Self> {
         T::from_object(obj).map(Box::new)
     }
@@ -477,7 +407,6 @@ macro_rules! int_impls {
         }
 
         impl FromObject for $t {
-            const REFERENCES_PYTHON: bool = false;
             fn from_object(obj: &Object) -> Result<Self> {
                 extract_int::<$t>(obj, $unsigned)
             }
@@ -500,25 +429,16 @@ impl IntoObject for u8 {
     fn output_hint() -> String {
         "int".to_owned()
     }
-    fn __vec_into_object(items: Vec<Self>) -> Result<Object> {
+    /// `bytes`, which is immutable, so also when `frozen`.
+    fn __vec_into_object(items: Vec<Self>, _frozen: bool) -> Result<Object> {
         attach(|py| Ok(Object::from_bound(PyBytes::new(py, &items).into_any())))
     }
-    fn __vec_output_hint() -> String {
+    fn __vec_output_hint(_frozen: bool) -> String {
         "bytes".to_owned()
-    }
-    fn __vec_shape() -> ViewShape {
-        ViewShape::Plain
-    }
-    fn __vec_view_hint() -> String {
-        "bytes".to_owned()
-    }
-    fn __vec_input_hint_into() -> String {
-        "bytes | bytearray | collections.abc.Sequence[int]".to_owned()
     }
 }
 
 impl FromObject for u8 {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         extract_int::<u8>(obj, true)
     }
@@ -556,7 +476,6 @@ impl IntoObject for f64 {
 }
 
 impl FromObject for f64 {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         extract_f64(obj)
     }
@@ -577,7 +496,6 @@ impl IntoObject for f32 {
 /// A finite value outside `f32`'s range raises `OverflowError`; `inf` and
 /// `nan` pass through. Precision is rounded as usual.
 impl FromObject for f32 {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         let v = extract_f64(obj)?;
         let narrow = v as f32;
@@ -601,7 +519,6 @@ impl IntoObject for bool {
 }
 
 impl FromObject for bool {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);
@@ -655,7 +572,6 @@ impl IntoObject for Cow<'_, str> {
 }
 
 impl FromObject for String {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);
@@ -672,7 +588,6 @@ impl FromObject for String {
 
 /// Always produces `Cow::Owned`.
 impl FromObject for Cow<'static, str> {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         String::from_object(obj).map(Cow::Owned)
     }
@@ -692,7 +607,6 @@ impl IntoObject for char {
 
 /// Accepts a `str` of length 1.
 impl FromObject for char {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         let s = String::from_object(obj)?;
         let mut chars = s.chars();
@@ -719,9 +633,6 @@ impl IntoObject for PathBuf {
     fn output_hint() -> String {
         "pathlib.Path".to_owned()
     }
-    fn __input_hint() -> String {
-        "str | os.PathLike[str]".to_owned()
-    }
 }
 
 /// Becomes a `pathlib.Path`.
@@ -746,7 +657,6 @@ impl IntoObject for &Path {
 
 /// Accepts a `str` or an `os.PathLike` object (such as `pathlib.Path`).
 impl FromObject for PathBuf {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);
@@ -760,6 +670,9 @@ impl FromObject for PathBuf {
     }
     fn input_hint() -> String {
         "str | os.PathLike[str]".to_owned()
+    }
+    fn __read_back_hint() -> Option<String> {
+        Some("pathlib.Path".to_owned())
     }
 }
 
@@ -777,7 +690,6 @@ impl IntoObject for () {
 
 /// Accepts only `None`.
 impl FromObject for () {
-    const REFERENCES_PYTHON: bool = false;
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);
@@ -800,20 +712,18 @@ impl<T: IntoObject> IntoObject for Option<T> {
     fn output_hint() -> String {
         optional_hint(T::output_hint())
     }
-    fn __shape() -> ViewShape {
-        T::__shape()
+    fn __into_frozen(self) -> Result<Object> {
+        match self {
+            Some(v) => v.__into_frozen(),
+            None => Ok(Object::none()),
+        }
     }
-    fn __view_hint() -> String {
-        optional_hint(T::__view_hint())
-    }
-    fn __input_hint() -> String {
-        optional_hint(T::__input_hint())
+    fn __frozen_hint() -> String {
+        optional_hint(T::__frozen_hint())
     }
 }
 
 impl<T: FromObject> FromObject for Option<T> {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
-    const __HANDLE_OF: Option<&'static str> = T::__HANDLE_OF;
     fn from_object(obj: &Object) -> Result<Self> {
         if obj.is_none() { Ok(None) } else { T::from_object(obj).map(Some) }
     }
@@ -827,29 +737,26 @@ impl<T: FromObject> FromObject for Option<T> {
 /// Becomes a new `list` (`bytes` for `Vec<u8>`).
 impl<T: IntoObject> IntoObject for Vec<T> {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(self)
+        T::__vec_into_object(self, false)
     }
     fn output_hint() -> String {
-        T::__vec_output_hint()
+        T::__vec_output_hint(false)
     }
-    fn __shape() -> ViewShape {
-        T::__vec_shape()
+    fn __into_frozen(self) -> Result<Object> {
+        T::__vec_into_object(self, true)
     }
-    fn __view_hint() -> String {
-        T::__vec_view_hint()
-    }
-    fn __input_hint() -> String {
-        T::__vec_input_hint_into()
+    fn __frozen_hint() -> String {
+        T::__vec_output_hint(true)
     }
 }
 
 /// Becomes a new `list` (`bytes` for `&[u8]`).
 impl<T: IntoObject + Clone> IntoObject for &[T] {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(self.to_vec())
+        T::__vec_into_object(self.to_vec(), false)
     }
     fn output_hint() -> String {
-        T::__vec_output_hint()
+        T::__vec_output_hint(false)
     }
 }
 
@@ -859,31 +766,23 @@ impl<T: IntoObject + Clone> IntoObject for &Vec<T> {
         self.as_slice().into_object()
     }
     fn output_hint() -> String {
-        T::__vec_output_hint()
+        T::__vec_output_hint(false)
     }
 }
 
 /// Becomes a new `list` (`bytes` for `[u8; N]`).
 impl<T: IntoObject, const N: usize> IntoObject for [T; N] {
     fn into_object(self) -> Result<Object> {
-        T::__vec_into_object(Vec::from(self))
+        T::__vec_into_object(Vec::from(self), false)
     }
     fn output_hint() -> String {
-        T::__vec_output_hint()
+        T::__vec_output_hint(false)
     }
-    /// Arrays are copies (a plain `list`), but container elements of them
-    /// are live views.
-    fn __shape() -> ViewShape {
-        ViewShape::array(T::__shape())
+    fn __into_frozen(self) -> Result<Object> {
+        T::__vec_into_object(Vec::from(self), true)
     }
-    fn __view_hint() -> String {
-        match T::__shape() {
-            ViewShape::Plain => T::__vec_output_hint(),
-            _ => format!("list[{}]", T::__view_hint()),
-        }
-    }
-    fn __input_hint() -> String {
-        T::__vec_input_hint_into()
+    fn __frozen_hint() -> String {
+        T::__vec_output_hint(true)
     }
 }
 
@@ -891,7 +790,6 @@ impl<T: IntoObject, const N: usize> IntoObject for [T; N] {
 /// `bytes`, `bytearray` and `memoryview`; elements are converted strictly.
 /// `Vec<u8>` additionally accepts `bytes` and `bytearray`.
 impl<T: FromObject> FromObject for Vec<T> {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         T::__vec_from_object(obj)
     }
@@ -902,7 +800,6 @@ impl<T: FromObject> FromObject for Vec<T> {
 
 /// Accepts what `Vec<T>` accepts, with exactly `N` elements.
 impl<T: FromObject, const N: usize> FromObject for [T; N] {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         let items = T::__vec_from_object(obj)?;
         let len = items.len();
@@ -929,22 +826,65 @@ fn dict_from_pairs<K: IntoObject, V: IntoObject>(
     })
 }
 
-/// Converts a `dict` into key/value pairs from a snapshot of its items.
-fn pairs_from_dict<K: FromObject, V: FromObject>(
+/// A read-only `types.MappingProxyType` over a new `dict` of the frozen
+/// entries.
+fn frozen_mapping<K: IntoObject, V: IntoObject>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> Result<Object> {
+    attach(|py| {
+        let dict = PyDict::new(py);
+        for (k, v) in pairs {
+            dict.set_item(k.__into_frozen()?.into_py(), v.__into_frozen()?.into_py())?;
+        }
+        let proxy = py.import("types")?.getattr("MappingProxyType")?.call1((dict,))?;
+        Ok(Object::from_bound(proxy))
+    })
+}
+
+fn frozen_mapping_hint<K: IntoObject, V: IntoObject>() -> String {
+    format!("types.MappingProxyType[{}, {}]", K::__frozen_hint(), V::__frozen_hint())
+}
+
+/// Converts a `dict` or any other `collections.abc.Mapping` into key/value
+/// pairs from a snapshot of its items.
+fn pairs_from_mapping<K: FromObject, V: FromObject>(
     obj: &Object,
     mut sink: impl FnMut(K, V),
 ) -> Result<()> {
     attach(|py| {
         let b = obj.bind(py);
-        let dict = b.cast::<PyDict>().map_err(|_| type_mismatch("dict", b))?;
-        // `items()` copies the entries into a new list, so converting them
-        // (which may run arbitrary Python code) cannot invalidate iteration.
-        for item in dict.items().iter() {
-            let (k, v) = item.cast_into::<PyTuple>()?.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
-            sink(extract_bound(&k)?, extract_bound(&v)?);
+        // Both are new lists, so converting the entries (which may run
+        // arbitrary Python code) cannot invalidate the iteration. A `dict`
+        // (or subclass) is read from its own storage, without calling an
+        // overridden `items()`; another mapping through its `items()`.
+        let items = if let Ok(dict) = b.cast::<PyDict>() {
+            dict.items()
+        } else if let Ok(mapping) = b.cast::<PyMapping>() {
+            mapping.items()?
+        } else {
+            return Err(type_mismatch("a mapping", b));
+        };
+        for item in items.iter() {
+            let pair = match item.cast::<PyTuple>() {
+                Ok(pair) if pair.len() == 2 => pair,
+                _ => return Err(type_mismatch("a (key, value) tuple", &item)),
+            };
+            sink(extract_bound(&pair.get_item(0)?)?, extract_bound(&pair.get_item(1)?)?);
         }
         Ok(())
     })
+}
+
+/// `Mapping` is invariant in its key type, so when the keys Python reads
+/// back are typed differently from what the key conversion accepts
+/// (`pathlib.Path` vs `str | os.PathLike[str]`), both mappings are listed.
+fn mapping_input_hint<K: FromObject, V: FromObject>() -> String {
+    let value = V::input_hint();
+    let hint = format!("collections.abc.Mapping[{}, {value}]", K::input_hint());
+    match K::__read_back_hint() {
+        Some(key) => format!("{hint} | collections.abc.Mapping[{key}, {value}]"),
+        None => hint,
+    }
 }
 
 fn set_from_items<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<Object> {
@@ -954,6 +894,17 @@ fn set_from_items<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<O
             set.add(into_bound(py, item)?)?;
         }
         Ok(Object::from_bound(set.into_any()))
+    })
+}
+
+/// A `frozenset` of the frozen elements.
+fn frozen_set<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<Object> {
+    attach(|py| {
+        let items = items
+            .into_iter()
+            .map(|item| Ok(item.__into_frozen()?.into_py().into_bound(py)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Object::from_bound(PyFrozenSet::new(py, items)?.into_any()))
     })
 }
 
@@ -979,55 +930,31 @@ impl<K: IntoObject, V: IntoObject, S> IntoObject for HashMap<K, V, S> {
     fn output_hint() -> String {
         format!("dict[{}, {}]", K::output_hint(), V::output_hint())
     }
-    fn __shape() -> ViewShape {
-        ViewShape::Dict(Box::new(V::__shape()))
+    fn __into_frozen(self) -> Result<Object> {
+        frozen_mapping(self)
     }
-    fn __view_hint() -> String {
-        mapping_view_hint::<K, V>()
-    }
-    fn __input_hint() -> String {
-        format!("dict[{}, {}]", K::__input_hint(), V::__input_hint())
+    fn __frozen_hint() -> String {
+        frozen_mapping_hint::<K, V>()
     }
 }
 
-/// View hint of a map: keys are copies, values may be views themselves.
-fn mapping_view_hint<K: IntoObject, V: IntoObject>() -> String {
-    format!(
-        "_orochi.DictView[{}, {}, {}, {}]",
-        K::output_hint(),
-        V::__view_hint(),
-        V::__input_hint(),
-        V::output_hint()
-    )
-}
-
-/// View hint of a set (elements are hashable, never views).
-fn set_view_hint<T: IntoObject>() -> String {
-    format!("_orochi.SetView[{}]", T::output_hint())
-}
-
-fn set_input_hint<T: IntoObject>() -> String {
-    let t = T::__input_hint();
-    format!("set[{t}] | frozenset[{t}]")
-}
-
-/// Accepts a `dict` (or subclass).
+/// Accepts any `collections.abc.Mapping` (`dict`, `types.MappingProxyType`,
+/// ...).
 impl<K, V, S> FromObject for HashMap<K, V, S>
 where
     K: FromObject + Eq + Hash,
     V: FromObject,
     S: BuildHasher + Default,
 {
-    const REFERENCES_PYTHON: bool = K::REFERENCES_PYTHON || V::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         let mut out = HashMap::with_hasher(S::default());
-        pairs_from_dict(obj, |k, v| {
+        pairs_from_mapping(obj, |k, v| {
             out.insert(k, v);
         })?;
         Ok(out)
     }
     fn input_hint() -> String {
-        format!("dict[{}, {}]", K::input_hint(), V::input_hint())
+        mapping_input_hint::<K, V>()
     }
 }
 
@@ -1039,29 +966,26 @@ impl<K: IntoObject, V: IntoObject> IntoObject for BTreeMap<K, V> {
     fn output_hint() -> String {
         format!("dict[{}, {}]", K::output_hint(), V::output_hint())
     }
-    fn __shape() -> ViewShape {
-        ViewShape::Dict(Box::new(V::__shape()))
+    fn __into_frozen(self) -> Result<Object> {
+        frozen_mapping(self)
     }
-    fn __view_hint() -> String {
-        mapping_view_hint::<K, V>()
-    }
-    fn __input_hint() -> String {
-        format!("dict[{}, {}]", K::__input_hint(), V::__input_hint())
+    fn __frozen_hint() -> String {
+        frozen_mapping_hint::<K, V>()
     }
 }
 
-/// Accepts a `dict` (or subclass).
+/// Accepts any `collections.abc.Mapping` (`dict`, `types.MappingProxyType`,
+/// ...).
 impl<K: FromObject + Ord, V: FromObject> FromObject for BTreeMap<K, V> {
-    const REFERENCES_PYTHON: bool = K::REFERENCES_PYTHON || V::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         let mut out = BTreeMap::new();
-        pairs_from_dict(obj, |k, v| {
+        pairs_from_mapping(obj, |k, v| {
             out.insert(k, v);
         })?;
         Ok(out)
     }
     fn input_hint() -> String {
-        format!("dict[{}, {}]", K::input_hint(), V::input_hint())
+        mapping_input_hint::<K, V>()
     }
 }
 
@@ -1073,14 +997,11 @@ impl<T: IntoObject, S> IntoObject for HashSet<T, S> {
     fn output_hint() -> String {
         format!("set[{}]", T::output_hint())
     }
-    fn __shape() -> ViewShape {
-        ViewShape::Set
+    fn __into_frozen(self) -> Result<Object> {
+        frozen_set(self)
     }
-    fn __view_hint() -> String {
-        set_view_hint::<T>()
-    }
-    fn __input_hint() -> String {
-        set_input_hint::<T>()
+    fn __frozen_hint() -> String {
+        format!("frozenset[{}]", T::__frozen_hint())
     }
 }
 
@@ -1090,7 +1011,6 @@ where
     T: FromObject + Eq + Hash,
     S: BuildHasher + Default,
 {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         let mut out = HashSet::with_hasher(S::default());
         items_from_set(obj, |v| {
@@ -1112,20 +1032,16 @@ impl<T: IntoObject> IntoObject for BTreeSet<T> {
     fn output_hint() -> String {
         format!("set[{}]", T::output_hint())
     }
-    fn __shape() -> ViewShape {
-        ViewShape::Set
+    fn __into_frozen(self) -> Result<Object> {
+        frozen_set(self)
     }
-    fn __view_hint() -> String {
-        set_view_hint::<T>()
-    }
-    fn __input_hint() -> String {
-        set_input_hint::<T>()
+    fn __frozen_hint() -> String {
+        format!("frozenset[{}]", T::__frozen_hint())
     }
 }
 
 /// Accepts a `set` or `frozenset` (or subclasses).
 impl<T: FromObject + Ord> FromObject for BTreeSet<T> {
-    const REFERENCES_PYTHON: bool = T::REFERENCES_PYTHON;
     fn from_object(obj: &Object) -> Result<Self> {
         let mut out = BTreeSet::new();
         items_from_set(obj, |v| {
@@ -1155,15 +1071,20 @@ macro_rules! tuple_impls {
                 let parts: &[String] = &[$($name::output_hint()),+];
                 format!("tuple[{}]", parts.join(", "))
             }
-            fn __input_hint() -> String {
-                let parts: &[String] = &[$($name::__input_hint()),+];
+            fn __into_frozen(self) -> Result<Object> {
+                attach(|py| {
+                    let items = [$(self.$idx.__into_frozen()?.into_py().into_bound(py)),+];
+                    Ok(Object::from_bound(PyTuple::new(py, items)?.into_any()))
+                })
+            }
+            fn __frozen_hint() -> String {
+                let parts: &[String] = &[$($name::__frozen_hint()),+];
                 format!("tuple[{}]", parts.join(", "))
             }
         }
 
         /// Accepts a `tuple` (or subclass) of exactly this length.
         impl<$($name: FromObject),+> FromObject for ($($name,)+) {
-            const REFERENCES_PYTHON: bool = false $(|| $name::REFERENCES_PYTHON)+;
             fn from_object(obj: &Object) -> Result<Self> {
                 attach(|py| {
                     let b = obj.bind(py);

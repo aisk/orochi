@@ -13,12 +13,14 @@ pub(crate) fn attach<F, R>(f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,
 {
-    if Python::try_attach(|_| ()).is_none() {
-        ensure_interpreter();
+    let mut f = Some(f);
+    if let Some(r) = Python::try_attach(|py| (f.take().expect("not called yet"))(py)) {
+        return r;
     }
+    ensure_interpreter();
     // If attaching is still impossible (the interpreter is finalizing, or we
     // are inside a GC traversal), pyo3 panics with a precise message.
-    Python::attach(f)
+    Python::attach(f.take().expect("not called by `try_attach`"))
 }
 
 /// Like [`attach`], but never panics: returns `None` if the interpreter is not
@@ -37,52 +39,19 @@ const NOT_RUNNING: &str = "orochi: the Python interpreter is not running. Inside
     extension module it always is; to use orochi from a standalone Rust program or its tests, \
     enable the `embed` feature of orochi.";
 
-#[derive(Debug, PartialEq)]
-enum Startup {
-    /// Initialized: let `Python::attach` proceed (it reports finalization or
-    /// GC-traversal states itself).
-    Proceed,
-    /// Not initialized, but `embed` allows starting it.
-    Initialize,
-    /// Not initialized and not allowed to start it.
-    Fail(&'static str),
-}
-
-fn startup(initialized: bool, embed: bool) -> Startup {
-    match (initialized, embed) {
-        (true, _) => Startup::Proceed,
-        (false, true) => Startup::Initialize,
-        (false, false) => Startup::Fail(NOT_RUNNING),
-    }
-}
-
+/// Starts the interpreter if it is not initialized and `embed` allows it;
+/// otherwise panics with an explanation. Only called when attaching failed:
+/// `Py_IsInitialized` is already false while the interpreter finalizes, when
+/// `__del__` methods may still call into orochi.
 #[cold]
 fn ensure_interpreter() {
     // SAFETY: `Py_IsInitialized` may be called at any time, even before the
     // interpreter is initialized or after it has been finalized.
-    let initialized = unsafe { pyo3::ffi::Py_IsInitialized() } != 0;
-    match startup(initialized, cfg!(feature = "embed")) {
-        Startup::Proceed => {}
-        Startup::Initialize => Python::initialize(),
-        Startup::Fail(message) => panic!("{message}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn startup_decision() {
-        assert_eq!(startup(true, false), Startup::Proceed);
-        assert_eq!(startup(true, true), Startup::Proceed);
-        assert_eq!(startup(false, true), Startup::Initialize);
-        match startup(false, false) {
-            Startup::Fail(msg) => {
-                assert!(msg.contains("enable the `embed` feature of orochi"));
-                assert!(!msg.contains("auto-initialize"));
-            }
-            other => panic!("unexpected {other:?}"),
+    if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+        if cfg!(feature = "embed") {
+            Python::initialize();
+        } else {
+            panic!("{NOT_RUNNING}");
         }
     }
 }

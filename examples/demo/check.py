@@ -9,6 +9,7 @@ With STUBS_DIR, the module's type stubs are also written there (for
 import ast
 import math
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -48,28 +49,37 @@ assert p == demo.Point(6, 4) and p != demo.Point(0, 0)
 assert repr(p) == "Point { x: 6.0, y: 4.0 }" and str(p) == "(6, 4)"
 assert type(p).__module__ == "demo"
 
+# A value field reads as an immutable snapshot; a `List<T>` field is the
+# Python list itself.
 b = demo.Basket()
-b.items.append("apple")
-b.table.setdefault("k", []).append(1)
-b.table["k"].append(2)
-assert b.count() == 3 and b.items == ["apple"] and b.table == {"k": [1, 2]}
+b.tags.append("x")
+assert b.tags == ["x"] and b.tags is b.tags
+b.items = [1, 2]
+b.add_item(3)
+assert b.items == (1, 2, 3) and type(b.items) is tuple
+for mutate in (lambda: b.items.append(4), lambda: b.table.__setitem__("k", [1])):
+    try:
+        mutate()
+    except (AttributeError, TypeError):
+        pass
+    else:
+        raise AssertionError("a snapshot was changed")
+items = list(b.items)
+items.append(4)
+assert b.items == (1, 2, 3)
+b.table = {"k": [1, 2]}
+assert dict(b.table) == {"k": (1, 2)} and b.count() == 6
+other = demo.Basket()
+other.table = b.table
+other.items = b.items
+assert dict(other.table) == {"k": (1, 2)} and other.items == (1, 2, 3)
 try:
-    b.items.append(1)
+    b.items = ["x"]
 except TypeError:
     pass
 else:
-    raise AssertionError("int accepted in Vec<String>")
-assert list(b.items) == ["apple"]
-demo.push_twice(b.numbers, 7)
-b.items += ["pear"]
-b.items.sort(reverse=True)
-plain = b.items.copy()
-assert type(plain) is list and plain == ["pear", "apple"] and b.numbers == [7, 7]
-other = demo.Basket()
-other.table = {"t": [1]}
-b.table = other.table
-b.table["t"].append(2)
-assert other.table == {"t": [1]} and b.table == {"t": [1, 2]}
+    raise AssertionError("str accepted in Vec<i64>")
+assert b.items == (1, 2, 3)
 for bad_ctor in (lambda: demo.Color(), lambda: demo.Color(1)):
     try:
         bad_ctor()
@@ -96,17 +106,17 @@ for line in [
     "from . import geometry as geometry",
     "def add(a: int, b: int | None = None) -> int:",
     "def read_text(path: str | os.PathLike[str]) -> str: ...",
-    "def push_twice(xs: list[int] | ListView[int, int, int], v: int) -> None:",
+    "def push_twice(xs: list[int], v: int) -> None:",
     "class Point:",
     "    def __new__(cls, x: float, y: float) -> Point: ...",
     "    def scale(self, k: float) -> Point: ...",
     "    __hash__: typing.ClassVar[None]  # type: ignore[assignment]",
-    "    def items(self) -> ListView[str, str, str]: ...",
-    "    def items(self, value: collections.abc.Sequence[str] | ListView[str, str, str]) -> None: ...",
+    "    def items(self) -> tuple[int, ...]:",
+    "    def items(self, value: collections.abc.Sequence[int]) -> None: ...",
+    "    def table(self) -> types.MappingProxyType[str, tuple[int, ...]]:",
+    "    def tags(self) -> list[str]:",
     "    Red: typing.Final[Color]",
     "    def __new__(cls, _not_constructible: typing.NoReturn, /) -> Color: ...",
-    "@typing.type_check_only",
-    "class ListView(collections.abc.MutableSequence[_T], typing.Generic[_T, _I, _P]):",
     "def favorite() -> Color: ...",
 ]:
     assert line in init.splitlines(), f"missing in demo/__init__.pyi: {line!r}\n{init}"
@@ -116,5 +126,23 @@ out_dir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp()
 assert demo._orochi_stubs(out_dir=pathlib.Path(out_dir)) == stubs
 for path, text in stubs.items():
     assert (pathlib.Path(out_dir) / path).read_text(encoding="utf-8") == text
+
+# A `__del__` that calls the extension while the interpreter shuts down (the
+# cycle is collected after `Py_IsInitialized()` already returns false).
+SHUTDOWN = """
+import demo
+
+class Cycle:
+    def __init__(self):
+        self.me = self
+
+    def __del__(self):
+        print("lines:", demo.count_lines("a\\nb"))
+
+c = Cycle()
+"""
+done = subprocess.run([sys.executable, "-c", SHUTDOWN], capture_output=True, text=True)
+assert done.returncode == 0 and "panicked" not in done.stderr, done
+assert "lines: 2" in done.stdout, done
 
 print("demo extension module OK:", demo.__file__)

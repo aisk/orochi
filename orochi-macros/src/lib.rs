@@ -109,8 +109,9 @@ fn parse_args(args: TokenStream2) -> syn::Result<Option<LitStr>> {
 }
 
 struct Cx {
-    /// Exported classes of each module, by module path relative to the root
-    /// (`[]` is the root, `["geometry"]` its submodule).
+    /// Exported structs of each module, by module path relative to the root
+    /// (`[]` is the root, `["geometry"]` its submodule). Enums are not
+    /// included: their members are immutable singletons, fine in a field.
     modules: HashMap<Vec<String>, HashSet<String>>,
     errors: Vec<syn::Error>,
 }
@@ -120,8 +121,8 @@ impl Cx {
         self.errors.push(syn::Error::new_spanned(tokens, message));
     }
 
-    /// The class `path` names when written inside module `current`: a class
-    /// of that module (`P`, `self::P`), or of a module reached with
+    /// The struct class `path` names when written inside module `current`: a
+    /// struct of that module (`P`, `self::P`), or of a module reached with
     /// `super::` / submodule names. `None` for anything else.
     fn resolve_class(&self, current: &[String], path: &Path) -> Option<String> {
         if path.leading_colon.is_some() {
@@ -165,9 +166,6 @@ fn collect_classes(
         match item {
             Item::Struct(s) if is_pub(&s.vis) => {
                 classes.insert(s.ident.unraw().to_string());
-            }
-            Item::Enum(e) if is_pub(&e.vis) => {
-                classes.insert(e.ident.unraw().to_string());
             }
             Item::Mod(m) if is_pub(&m.vis) => {
                 let mut sub = path.clone();
@@ -732,8 +730,8 @@ fn process_struct(
                     __orochi_class.property(
                         #py_name,
                         #doc,
-                        (&&::orochi::__private::hint::Hint::<#ty>::new()).field(),
-                        (&&&::orochi::__private::hint::Hint::<#ty>::new()).setter(),
+                        (&&::orochi::__private::hint::Hint::<#ty>::new()).frozen(),
+                        (&&::orochi::__private::hint::Hint::<#ty>::new()).input(),
                     );
                 });
                 let getter = format_ident!("__orochi_get_{}", ident.unraw());
@@ -747,16 +745,7 @@ fn process_struct(
                     fn #getter(
                         __orochi_self: &::orochi::pyo3::Bound<'_, Self>,
                     ) -> ::orochi::__private::PyResultObject {
-                        #[allow(unused_imports)]
-                        use ::orochi::__private::{CopyFieldKind as _, LiveFieldKind as _};
-                        (&&::orochi::__private::FieldSpec::<#ty>::new()).field_kind().get(
-                            __orochi_self,
-                            #py_name,
-                            |o| ::orochi::__private::raw_get(o, |s: &Self| &s.#ident),
-                            |o, v| ::orochi::__private::raw_set(
-                                o, v, #what, |s: &mut Self| &mut s.#ident,
-                            ),
-                        )
+                        ::orochi::__private::get_field(__orochi_self, |s: &Self| &s.#ident)
                     }
 
                     #(#cfg)*
@@ -790,7 +779,7 @@ fn process_struct(
     (s, class)
 }
 
-/// A `pub` field that holds a class of this invocation by value (directly or
+/// A `pub` field that holds a struct class of this invocation by value (directly or
 /// inside `Vec`, `Option`, a map, ...) would be read from Python as copies, so
 /// `obj.field.x = ...` would silently change a copy.
 fn check_field_type(cx: &mut Cx, ty: &Type, path: &[String]) {
@@ -1231,10 +1220,9 @@ fn hint_uses() -> TokenStream2 {
     quote! {
         #[allow(unused_imports)]
         use ::orochi::__private::hint::{
-            BorrowedClassHint as _, BorrowedHint as _, BorrowedHintAny as _, FieldHint as _,
-            FieldHintAny as _, InputHint as _, InputHintAny as _, MutableClassHint as _,
-            MutableHint as _, MutableHintAny as _, OutputHint as _, OutputHintAny as _,
-            OutputResultHint as _, SetterHint as _, SetterHintAny as _, SetterViewHint as _,
+            BorrowedClassHint as _, BorrowedHint as _, BorrowedHintAny as _, FrozenHint as _,
+            FrozenHintAny as _, InputHint as _, InputHintAny as _, OutputHint as _,
+            OutputHintAny as _, OutputResultHint as _,
         };
     }
 }
@@ -1250,11 +1238,10 @@ fn stub_function(a: &Analyzed, sig: &Signature, attrs: &[Attribute], kind: Kind)
         let ty = &p.ty;
         let hint = match p.pass {
             Pass::Value => quote!((&&#hint::<#ty>::new()).input()),
-            Pass::Ref => quote!((&&&#hint::<#ty>::new()).borrowed()),
+            Pass::Ref | Pass::RefMut => quote!((&&&#hint::<#ty>::new()).borrowed()),
             Pass::OptRef => quote! {
                 ::orochi::__private::hint::optional((&&&#hint::<#ty>::new()).borrowed())
             },
-            Pass::RefMut => quote!((&&&#hint::<#ty>::new()).mutable()),
         };
         let default_none = p.default_none;
         quote!(::orochi::__private::stub::Param::new(#name, #hint, #default_none))
@@ -1447,19 +1434,10 @@ fn analyze(cx: &mut Cx, sig: &Signature, kind: Kind, class: Option<&Class>) -> O
                 check_python_name(cx, &name, &ident, "parameter");
                 check_type(cx, &pt.ty, "parameter");
                 let (ty, pass) = match &*pt.ty {
-                    Type::Reference(r) => {
-                        if r.mutability.is_some() {
-                            check_mut_referent(cx, &r.elem);
-                        }
-                        (
-                            (*r.elem).clone(),
-                            if r.mutability.is_some() {
-                                Pass::RefMut
-                            } else {
-                                Pass::Ref
-                            },
-                        )
-                    }
+                    Type::Reference(r) => (
+                        (*r.elem).clone(),
+                        if r.mutability.is_some() { Pass::RefMut } else { Pass::Ref },
+                    ),
                     ty => match option_inner(ty) {
                         Some(Type::Reference(r)) if r.mutability.is_none() => {
                             ((*r.elem).clone(), Pass::OptRef)
@@ -1524,29 +1502,6 @@ fn analyze(cx: &mut Cx, sig: &Signature, kind: Kind, class: Option<&Class>) -> O
         ret,
         ret_span,
     })
-}
-
-/// Clear errors for `&mut` referents that can never be written back.
-fn check_mut_referent(cx: &mut Cx, ty: &Type) {
-    match ty {
-        Type::Slice(_) => cx.error(
-            ty,
-            "`&mut [T]` cannot be a parameter of an exported function: a Python list can \
-             change length, so take `&mut Vec<T>` (changes are written back into the caller's \
-             list)",
-        ),
-        Type::Path(tp) if tp.path.is_ident("str") => cx.error(
-            ty,
-            "`&mut str` cannot be a parameter of an exported function: Python strings are \
-             immutable; take `&str` and return a new `String`",
-        ),
-        Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "Object") => cx.error(
-            ty,
-            "`&mut Object` is not needed: an `Object` parameter already refers to the \
-                 caller's Python object, so take `Object` (or `&Object`) and call its methods",
-        ),
-        _ => {}
-    }
 }
 
 /// Rejects `impl Trait` and explicit lifetimes (other than `'static`).
@@ -1734,16 +1689,11 @@ struct Parts {
     /// Python parameter list for `__text_signature__`.
     py_params: Vec<String>,
     wrapper_args: Vec<TokenStream2>,
-    /// Checks on the raw arguments, before any conversion.
-    checks: Vec<TokenStream2>,
     /// Conversions done before borrowing anything.
     holds: Vec<TokenStream2>,
     /// Borrows of class instances / temporaries, inside the call scope.
     guards: Vec<TokenStream2>,
     call_args: Vec<TokenStream2>,
-    /// Write-backs of `&mut` temporaries, after the call scope.
-    write_backs: Vec<TokenStream2>,
-    write_back_checks: Vec<TokenStream2>,
 }
 
 impl Parts {
@@ -1752,28 +1702,11 @@ impl Parts {
             signature: Vec::new(),
             py_params: Vec::new(),
             wrapper_args: Vec::new(),
-            checks: Vec::new(),
             holds: Vec::new(),
             guards: Vec::new(),
             call_args: Vec::new(),
-            write_backs: Vec::new(),
-            write_back_checks: Vec::new(),
         };
         let pyany = quote!(::orochi::pyo3::Py<::orochi::pyo3::PyAny>);
-        let mut_args: Vec<TokenStream2> = params
-            .iter()
-            .filter(|param| param.pass == Pass::RefMut)
-            .map(|param| {
-                let id = &param.ident;
-                let what = format!("argument '{}'", id.unraw());
-                quote!((&#id, #what))
-            })
-            .collect();
-        if mut_args.len() > 1 {
-            p.checks.push(quote! {
-                ::orochi::__private::check_aliasing(&[#(#mut_args),*])?;
-            });
-        }
         for param in params {
             let id = &param.ident;
             let ty = &param.ty;
@@ -1783,7 +1716,6 @@ impl Parts {
             let k = format_ident!("__orochi_k_{}", base);
             let h = format_ident!("__orochi_h_{}", base);
             let g = format_ident!("__orochi_g_{}", base);
-            let wb = format_ident!("__orochi_wb_{}", base);
             let py_name = id.unraw().to_string();
             if param.default_none {
                 p.py_params.push(format!("{py_name}=None"));
@@ -1836,9 +1768,6 @@ impl Parts {
                     p.guards
                         .push(quote_spanned! {span=> let mut #g = #k.get_mut(&mut #h)?; });
                     p.call_args.push(quote!(&mut *#g));
-                    p.write_backs
-                        .push(quote_spanned! {span=> let #wb = #k.write_back(#h); });
-                    p.write_back_checks.push(quote!(#wb?;));
                 }
             }
         }
@@ -1856,9 +1785,9 @@ impl Parts {
     }
 }
 
-/// The wrapper body: check and convert arguments, borrow, call, convert the
-/// result, release borrows, write `&mut` temporaries back. `self` by value
-/// is a copy of the instance (for an enum, of the member, without `Clone`).
+/// The wrapper body: convert arguments, borrow, call, convert the result,
+/// release borrows. `self` by value is a copy of the instance (for an enum,
+/// of the member, without `Clone`).
 fn body(
     a: &Analyzed,
     parts: &Parts,
@@ -1867,12 +1796,9 @@ fn body(
     what: &str,
     is_enum: bool,
 ) -> TokenStream2 {
-    let checks = &parts.checks;
     let holds = &parts.holds;
     let guards = &parts.guards;
     let call_args = &parts.call_args;
-    let write_backs = &parts.write_backs;
-    let write_back_checks = &parts.write_back_checks;
     let (self_borrow, self_arg) = match a.receiver {
         None => (quote!(), None),
         Some((Receiver::Ref, _)) => (
@@ -1939,11 +1865,6 @@ fn body(
     };
     let self_ptr = (kind != Kind::Ctor && a.ret != Ret::Convert)
         .then(|| quote!(let __orochi_self_ptr: *const Self = &*__orochi_guard;));
-    let out_ty = if kind == Kind::Ctor {
-        quote!(::orochi::pyo3::PyResult<Self>)
-    } else {
-        quote!(::orochi::__private::PyResultObject)
-    };
     quote! {
         #[allow(unused_imports)]
         use ::orochi::__private::{
@@ -1951,19 +1872,12 @@ fn body(
             CtorResultKind as _, OtherCloneKind as _, OtherRejectKind as _, OwnedParamKind as _,
             RetBadErrorKind as _, RetDisplayKind as _, RetFallbackKind as _, RetIntoKind as _,
         };
-        #(#checks)*
         #(#holds)*
-        let __orochi_out: #out_ty = {
-            #self_borrow
-            #self_ptr
-            #(#guards)*
-            let __orochi_ret = #callee(#(#args),*);
-            #convert
-        };
-        #(#write_backs)*
-        let __orochi_out = __orochi_out?;
-        #(#write_back_checks)*
-        ::core::result::Result::Ok(__orochi_out)
+        #self_borrow
+        #self_ptr
+        #(#guards)*
+        let __orochi_ret = #callee(#(#args),*);
+        #convert
     }
 }
 

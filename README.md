@@ -11,7 +11,7 @@ Python module, and `pub` means exported.
 #[orochi::module]
 mod mylib {
     //! My first extension module.
-    use std::collections::HashMap;
+    use orochi::prelude::*;
     use std::path::PathBuf;
 
     /// Add two integers.
@@ -27,9 +27,9 @@ mod mylib {
         xs.iter().sum()
     }
 
-    pub fn push_twice(xs: &mut Vec<i64>, v: i64) {
-        xs.push(v);
-        xs.push(v);
+    pub fn push_twice(xs: List<i64>, v: i64) -> Result<()> {
+        xs.push(v)?;                                // the caller's list itself
+        xs.push(v)
     }
 
     pub fn read_text(path: PathBuf) -> std::io::Result<String> {
@@ -72,19 +72,6 @@ mod mylib {
         }
     }
 
-    #[derive(Default)]
-    pub struct Basket {
-        pub items: Vec<String>,                     // reads as a live view of the Vec
-        pub table: HashMap<String, Vec<i64>>,
-        pub label: String,                          // reads as a copy
-    }
-
-    impl Basket {
-        pub fn new() -> Self {
-            Basket::default()
-        }
-    }
-
     pub enum Color {                                // members: Color.Red, Color.Green
         Red,
         Green,
@@ -111,7 +98,7 @@ mylib.add(True)              # TypeError: argument 'a': expected int, got bool
 mylib.read_text("missing")   # FileNotFoundError
 
 xs = [1]
-mylib.push_twice(xs, 5)      # xs == [1, 5, 5]: `&mut Vec` changes the caller's list
+mylib.push_twice(xs, 5)      # xs == [1, 5, 5]: a `List<i64>` is the caller's list
 
 p = mylib.Point(3, 4)
 p.norm()                     # 5.0
@@ -132,38 +119,67 @@ The items stay ordinary Rust: `mylib::add(1, None)` and
 constants, statics and inline `pub mod`s are exported; private and
 `pub(crate)` items are not. Doc comments become `__doc__`.
 
-**Parameters mean what they mean in Rust.**
+Everything else follows from three rules:
 
-| Parameter | What the function gets |
-|-----------|------------------------|
-| `T` (`i64`, `String`, `Vec<T>`, `HashMap<K, V>`, `PathBuf`, a class) | its own value, converted from the argument. Nothing it does is visible to the caller. A class taken by value is a copy and must be `Clone`. |
-| `&T` (`&str`, `&[T]`, `&Path`, `&HashMap<K, V>`, `&Point`, ...) | read-only access for the duration of the call |
-| `&mut T` (`&mut Vec<T>`, `&mut HashMap`/`BTreeMap`, `&mut HashSet`/`BTreeSet`, `&mut Point`) | changes are visible to the caller: a class instance is borrowed in place; a container is copied in and written back into the *same* `list`/`dict`/`set` after the call (also when the function returns `Err`). Passing the same container to two `&mut` parameters raises `RuntimeError`, like a class instance borrowed twice. |
-| `Option<T>` | `None` or a `T`; trailing `Option` parameters default to `None` |
+1. **Rust types are values.** `i64`, `String`, `Vec<T>`, `HashMap<K, V>`,
+   `PathBuf`, tuples, ... are converted (copied) on the way in and on the way
+   out. `&str`, `&[T]`, `&Path`, `&HashMap<K, V>`, `Option<&T>` parameters
+   borrow that converted copy: nothing the function does is visible to the
+   caller. A returned `Vec<T>` is a new `list`, a `HashMap` a new `dict` in
+   arbitrary order (use `BTreeMap` for a sorted, stable order).
+2. **orochi types are references.** `Object`, `List<T>`, `Dict<K, V>`,
+   `Set<T>` and `Ref<T>` refer to the caller's Python object itself: take a
+   `List<T>` to modify the caller's list, or to keep an object's identity.
+3. **Your own classes** (`pub struct`s of the module): `&Point`,
+   `&mut Point`, `&self` and `&mut self` borrow the instance itself (a
+   conflicting borrow raises `RuntimeError`); by value is a copy (the class
+   must be `Clone`); `Ref<Point>` is a handle. Any other Python type is an
+   `Object`.
 
-`&mut String`, `&mut i64` etc. are compile errors: Python `str` and `int` are
-immutable, so return the new value instead.
+`&mut` of anything but a class is a compile error. To modify the caller's
+list, dict or set, take `List<T>` / `Dict<K, V>` / `Set<T>`, which need no
+`&mut`; other Python values (`str`, `int`, tuples, ...) are immutable, so
+return the new value.
+Trailing `Option` parameters default to `None`.
 
-Write-back changes only what changed: a list is left alone when its contents
-are still equal (`==`), and otherwise replaced as a whole (`xs[:] = new`); a
-dict or set gets the removed keys deleted and the new or changed entries
-assigned, so untouched entries keep their objects and a dict keeps its order.
-New keys are appended in the Rust map's iteration order, which is sorted for
-`BTreeMap` and arbitrary for `HashMap`. Caveats: changed elements are
-converted both ways, so after a call that changes a `&mut Vec<Point>` the list
-holds new `Point` objects (use `Vec<Ref<Point>>` or `List<..>` to keep their
-identity), and changes made to the same container by other Python code during
-the call are overwritten.
+Fields follow the same rules:
+
+```rust
+# use orochi::List;
+pub struct Basket {
+    pub items: Vec<i64>,    // value: Python reads an immutable snapshot (a tuple); assign to replace
+    pub tags: List<String>, // reference: a real Python list, mutable in place
+}
+```
+
+```python
+b.tags.append("x")   # changes the basket's list
+b.items = [1, 2]     # replaces the value
+b.items              # (1, 2)
+b.items.append(3)    # AttributeError: 'tuple' object has no attribute 'append'
+```
+
+The `Vec` lives in the Rust struct, so Python can only be handed a snapshot
+of it: `Vec<T>` and arrays read as a `tuple`, sets as a `frozenset`, maps as
+a read-only `types.MappingProxyType`, also nested (a `Vec<u8>` reads as
+`bytes`), so a mutation fails instead of changing a copy. A snapshot is not a
+list: `b.items == [1, 2]` is `False`, compare with `(1, 2)`.
+`list(b.items)`, `dict(b.table)` and `set(b.tags)` give mutable copies (also
+what `json` and `pickle` need). References inside a value pass through
+(`Vec<Ref<Point>>` reads as a tuple of the instances), and a type with a
+hand-written `IntoObject` is handed over exactly as it builds it. A class
+held by value in a field is a compile error (`pub center: Point`,
+`pub points: Vec<Point>`): use `Ref<Point>` / `Vec<Ref<Point>>`, so that
+`c.center is p`. Enum members are immutable singletons and fine by value.
 
 Conversions are strict: a `float` is not an `int`, a `bool` is not a number,
 a `str` is not a list (see `orochi::IntoObject` / `orochi::FromObject`).
 Wrong arguments raise `TypeError`.
 
-**Return values** become new Python objects. A method returning `&Self` or
-`&mut Self` returns the same object (so calls can be chained); if it returns a
-reference to a *different* instance, that is copied when the class is `Clone`
-and raises `RuntimeError` otherwise. Other references (`&str`, `&[T]`, ...)
-are copied. `Result<T, E>` raises when it is
+**Return values.** A method returning `&Self` or `&mut Self` returns the same
+object (so calls can be chained); a reference to a *different* instance is
+copied when the class is `Clone` and raises `RuntimeError` otherwise. Other
+references (`&str`, `&[T]`, ...) are copied. `Result<T, E>` raises when it is
 `Err`: `std::io::Error` maps to the matching `OSError` subclass,
 `orochi::Error` to its own exception, and any other `E: Display` to
 `RuntimeError`. A panic raises `PanicException` instead of aborting.
@@ -176,55 +192,6 @@ implemented) become `__repr__`, `__str__`, `__eq__` and `__hash__`; a class
 with `PartialEq` but no `Hash` is unhashable, like in Python, and `Hash`
 without `PartialEq` is a compile error.
 
-Reading a field gives a copy of its value, except that fields of container
-type (`Vec<T>`, `HashMap`/`BTreeMap`, `HashSet`/`BTreeSet`, also inside
-`Option`) read as *live views* that change the struct:
-
-```python
-b = mylib.Basket()
-b.items.append("apple")          # changes the Rust `Vec`
-b.table.setdefault("k", []).append(1)   # nested containers are live too
-b.items.append(1)                # TypeError at once; the field is unchanged
-b.items = ["pear"]               # assigning the whole field works as usual
-json.dumps(b.table.copy())       # copy() gives plain builtins all the way down
-```
-
-A view supports what the builtin does (indexing, `len`, `in`, `==`, `repr`,
-the usual methods and operators) and is accepted where the container is
-converted or borrowed (`mylib.push_twice(b.items, 7)` updates the struct; a
-view passed or assigned by value is converted from its current contents). It
-is not a `list`/`dict`/`set` instance: `view.copy()` gives a builtin copy with
-nested views turned into plain containers, while `list(view)`, `dict(view)`
-and `set(view)` copy only the outer level. A slice is a `list` of the
-elements, which are views themselves when the elements are containers.
-Iteration runs over a snapshot taken when it starts. Operators with types the
-view does not know return `NotImplemented`, as the builtins do.
-
-Some differences from the builtins follow from the Rust types: a
-`HashMap`/`HashSet` view has Rust's arbitrary order, which can change after
-any modification (use `BTreeMap`/`BTreeSet` for sorted order), and
-`popitem()` removes an arbitrary item rather than the last inserted one. A
-view is not a handle: passing one where a `List<T>` / `Dict<K, V>` / `Set<T>`
-is expected raises `TypeError` (take `&mut Vec<T>` instead, or pass
-`list(view)`).
-
-Each operation copies the field out and, if it changes it, back in, so it is
-slow for large containers. Operations on views are atomic with respect to each
-other (one lock for all views), so threads appending to the same view lose no
-items; a plain field assignment or a Rust method that changes the field at the
-same time is not covered by that lock and can be overwritten by a view
-operation in progress, or overwrite it. A nested view addresses its position
-(index or key) in its parent, so after the parent is restructured it follows
-whatever is now at that position.
-
-Whether a field is a view depends on its Rust type, not its current value:
-handles (`List<T>`, `Object`, ...) and `Ref<T>` are the Python objects
-themselves, and other fields (numbers, strings, tuples, `PathBuf`, ...) are
-plain copies: `b.label += "x"` works, but mutating a copy does not change the
-struct. A fixed-size array reads as a plain `list` whose container elements
-are views (`s.grid[0].append(1)` changes the struct, `s.grid.append(...)` does
-not).
-
 A fieldless `pub enum` is a class whose members are attributes: they are
 singletons (`mylib.favorite() is mylib.Color.Red`), compare and hash by
 member whatever the enum derives, and only members are accepted as arguments.
@@ -233,14 +200,6 @@ The class is not iterable or callable (`list(Color)` and `Color(1)` raise
 created, even if `Color.Red` is later reassigned in Python; the stubs mark
 members `Final`, so type checkers reject such an assignment, but the runtime
 does not.
-
-**Sharing Python objects.** For a value that must outlive the call or keep
-its identity, use the handle types: `Object`, `List<T>`, `Dict<K, V>`,
-`Set<T>`, and `Ref<T>` for class instances. A field holding another class must
-be a `Ref` (`pub center: Ref<Point>`), so that `c.center is p` and
-`c.center.x = 5` changes `p`; `pub center: Point` is a compile error, and so is
-a class held by value inside a container (`pub points: Vec<Point>`; use
-`Vec<Ref<Point>>`).
 
 Unsupported items (generic or `async` functions, `impl Trait` parameters,
 explicit lifetimes, enums with data, `pub use`, `pub trait`, Python keywords
@@ -318,23 +277,20 @@ fn write_stubs() {
 
 Stubs include docstrings, parameter names and `None` defaults, and the
 types the conversions really accept and return: `Vec<T>` parameters take any
-`collections.abc.Sequence[T]`, but `&mut Vec<T>` needs a `list[T]` or a view
-(only those can be written back); `Result<T, E>` returns `T` and `&mut Self`
-the class. Container fields are properties typed with view classes that exist
-only for type checkers (`ListView`, `DictView`, `SetView`, defined in the root
-stub with `@typing.type_check_only`): `b.items.append("x")`,
-`b.items += [...]`, `mylib.push_twice(b.items, 7)` and `b.table =
-other.table` type-check, and `b.items.copy()` is a plain `list`. Classes are
-`@typing.final` with `__new__` from `new` (a class without `new`, and an enum,
-gets a `__new__` that no call matches); enum members are `Final` attributes
-of their class.
+`collections.abc.Sequence[T]`, `HashMap<K, V>` any
+`collections.abc.Mapping[K, V]` (also a field's `MappingProxyType`);
+`Result<T, E>` returns `T` and `&mut Self`
+the class. A field is a property typed with what reading it returns
+(`tuple[int, ...]` for a `Vec<i64>`) and a setter typed with what assigning
+accepts. Classes are `@typing.final` with `__new__` from `new` (a class
+without `new`, and an enum, gets a `__new__` that no call matches); enum
+members are `Final` attributes of their class.
 
 Stubs are looser than the runtime in places: an integer or string type only
-says `int` / `str` (not the range of a `u8`, say), a by-value `dict`/`set`
-parameter is typed with the builtin although a view is accepted too, and a
-custom conversion is only as precise as its hint. A custom `FromObject` / `IntoObject` hint is used as written:
-spell names fully qualified (`typing.Any`, `numpy.typing.NDArray[numpy.float64]`)
-and the stub imports their modules.
+says `int` / `str` (not the range of a `u8`, say), and a custom conversion is
+only as precise as its hint. A custom `FromObject` / `IntoObject` hint is used
+as written: spell names fully qualified (`typing.Any`,
+`numpy.typing.NDArray[numpy.float64]`) and the stub imports their modules.
 
 ## Embedding Python
 

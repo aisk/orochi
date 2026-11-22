@@ -18,9 +18,6 @@ pub trait IntoPyFunction<Marker>: Send + Sync + 'static {
     /// Number of positional parameters.
     const ARITY: usize;
 
-    /// Whether any parameter type refers to live Python state.
-    const REFERENCES_PYTHON: bool;
-
     /// Calls the closure; `args.len()` equals `ARITY`.
     fn invoke(&self, args: &[Object]) -> Result<Object>;
 
@@ -40,7 +37,6 @@ macro_rules! fn_impls {
             $($arg: FromObject,)*
         {
             const ARITY: usize = $len;
-            const REFERENCES_PYTHON: bool = false $(|| $arg::REFERENCES_PYTHON)*;
 
             #[allow(unused_variables)]
             fn invoke(&self, args: &[Object]) -> Result<Object> {

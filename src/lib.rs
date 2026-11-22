@@ -11,14 +11,16 @@
 //! ```
 //! #[orochi::module]
 //! mod mylib {
+//!     use orochi::prelude::*;
+//!
 //!     /// Add two integers.
 //!     pub fn add(a: i64, b: Option<i64>) -> i64 {
 //!         a + b.unwrap_or(1)
 //!     }
 //!
-//!     pub fn push_twice(xs: &mut Vec<i64>, v: i64) {
-//!         xs.push(v);
-//!         xs.push(v);
+//!     pub fn push_twice(xs: List<i64>, v: i64) -> Result<()> {
+//!         xs.push(v)?;
+//!         xs.push(v)
 //!     }
 //!
 //!     #[derive(Debug, Clone, PartialEq)]
@@ -49,9 +51,9 @@
 //! # Ok::<(), orochi::Error>(())
 //! ```
 //!
-//! See [`module`] for the rules (parameters follow Rust's ownership: values
-//! are copies, `&T` is read-only, `&mut Vec<T>` changes the caller's list),
-//! and the README for building the extension.
+//! See [`module`] for the rules (Rust types are values, orochi types such as
+//! [`List`] are references, your own classes are borrowed), and the README
+//! for building the extension.
 //!
 //! ## Calling Python
 //!
@@ -175,17 +177,12 @@ pub use pyo3;
 ///   without `self` is the constructor (it returns `Self` or
 ///   `Result<Self, E>`), other `pub fn`s with `self` / `&self` / `&mut self`
 ///   are methods, those without are static methods, and `pub const`s are
-///   class attributes. `pub` fields are read/write attributes. Reading one
-///   returns a copy of the field, except that fields of type `Vec<T>`,
-///   `HashMap`/`BTreeMap` or `HashSet`/`BTreeSet` (also in `Option`) read as
-///   live views: `obj.items.append(1)` changes the struct, an element of the
-///   wrong type raises `TypeError` at once, nested containers are live too,
-///   and `list(view)` / `dict(view)` / `set(view)` / `view.copy()` give a
-///   builtin copy. Derived or implemented `Debug`, `Display`, `PartialEq` and
-///   `Hash` provide `__repr__`, `__str__`, `__eq__` and `__hash__` (with
-///   `PartialEq` but without `Hash`, the class is unhashable, as in Python;
-///   `Hash` without `PartialEq` is a compile error). Classes must be
-///   `Send + Sync`.
+///   class attributes. `pub` fields are read/write attributes (see
+///   [Fields](#fields)). Derived or implemented `Debug`, `Display`,
+///   `PartialEq` and `Hash` provide `__repr__`, `__str__`, `__eq__` and
+///   `__hash__` (with `PartialEq` but without `Hash`, the class is
+///   unhashable, as in Python; `Hash` without `PartialEq` is a compile
+///   error). Classes must be `Send + Sync`.
 /// - A `pub enum` whose variants have no fields becomes a class whose
 ///   members are singleton attributes (`f() is Color.Red`); members compare
 ///   and hash by variant, and only members convert back into the enum.
@@ -196,55 +193,40 @@ pub use pyo3;
 ///
 /// # Parameters
 ///
-/// Parameters follow Rust's ownership rules:
+/// - **Rust types are values**: `i64`, `String`, `Vec<T>`, `HashMap<K, V>`,
+///   `PathBuf`, tuples, ... are converted with [`FromObject`] into the
+///   function's own value. `&str`, `&[T]`, `&Path`, `&HashMap<K, V>` and
+///   `Option<&T>` borrow such a converted value; nothing the function does is
+///   visible to the caller.
+/// - **orochi types are references**: [`Object`], [`List`], [`Dict`], [`Set`]
+///   and [`Ref`] refer to the caller's object itself, so a function taking
+///   `List<T>` can modify the caller's list, and can keep it beyond the call.
+/// - **Classes of the module** are borrowed in place as `&Point` /
+///   `&mut Point` (a conflicting borrow, e.g. `p.absorb(p)` with
+///   `&mut self` and `&Point`, raises `RuntimeError`); by value, a class is
+///   a copy and must implement `Clone`.
 ///
-/// - **By value** (`i64`, `String`, `Vec<T>`, `HashMap<K, V>`, `PathBuf`, a
-///   class): the function gets its own value, converted with [`FromObject`].
-///   A class taken by value is a copy and must implement `Clone`.
-/// - **`&T`** (`&str`, `&[T]`, `&Path`, `&HashMap<K, V>`, `&Point`,
-///   `Option<&str>`, ...): read-only access during the call. Class instances
-///   are borrowed in place; other values are converted into a temporary.
-/// - **`&mut T`**: changes are visible to the caller. A class instance is
-///   borrowed mutably in place. `&mut Vec<T>`, `&mut HashMap` /
-///   `&mut BTreeMap` and `&mut HashSet` / `&mut BTreeSet` require a `list`,
-///   `dict` or `set` argument, which is converted into a temporary and, after
-///   the function returns (`Ok` or `Err`, but not after a panic), written back
-///   into the same Python object. Other `&mut` parameters (`&mut String`,
-///   `&mut i64`, ...) are compile errors: Python `str` and `int` objects are
-///   immutable, so return the new value instead.
-///
-///   Write-back changes only what changed: an equal list is left alone, a
-///   changed one is replaced as a whole (`xs[:] = new`); a dict or set gets
-///   the removed entries deleted and new or changed (by `==`) ones assigned,
-///   new dict keys in the Rust map's order (sorted for `BTreeMap`, arbitrary
-///   for `HashMap`). Changed elements are converted in both directions: after
-///   a call that changes a `&mut Vec<Point>`, the list holds new `Point`
-///   objects (use `Vec<Ref<Point>>` or `List<..>` to keep their identity),
-///   and changes made to the same container by other Python code during the
-///   call are overwritten. The same container passed to two `&mut`
-///   parameters raises `RuntimeError`.
-/// - The handle types [`Object`], [`List`], [`Dict`], [`Set`] and [`Ref`]
-///   refer to the caller's object itself and can be kept beyond the call.
+/// `&mut` of any other type is a compile error. To modify the caller's list,
+/// dict or set, take `List<T>` / `Dict<K, V>` / `Set<T>`, which need no
+/// `&mut`; other Python values (`str`, `int`, tuples, ...) are immutable, so
+/// return the new value. A `HashMap`/`BTreeMap` parameter accepts any
+/// `collections.abc.Mapping`.
 ///
 /// Conversions are strict (see [`FromObject`]): `add(True)` and `add(1.5)`
 /// raise `TypeError`.
 ///
-/// Instance borrows are checked at runtime: a method taking `&mut self`
-/// called with `other` being the same object as `self` raises
-/// `RuntimeError` instead of aliasing.
-///
 /// ```
 /// #[orochi::module]
 /// mod lists {
-///     use std::collections::HashMap;
+///     use orochi::prelude::*;
 ///
-///     pub fn push_twice(xs: &mut Vec<i64>, v: i64) {
-///         xs.push(v);
-///         xs.push(v);
+///     pub fn push_twice(xs: List<i64>, v: i64) -> Result<()> {
+///         xs.push(v)?;
+///         xs.push(v)
 ///     }
 ///
-///     pub fn bump(counts: &mut HashMap<String, i64>, key: &str) {
-///         *counts.entry(key.to_owned()).or_insert(0) += 1;
+///     pub fn doubled(xs: Vec<i64>) -> Vec<i64> {
+///         xs.into_iter().map(|x| 2 * x).collect()
 ///     }
 /// }
 /// # lists::__orochi_module()?;
@@ -253,12 +235,26 @@ pub use pyo3;
 /// #     xs = [1]; same = xs
 /// #     lists.push_twice(xs, 2)
 /// #     assert xs == [1, 2, 2] and xs is same
-/// #     d = {}
-/// #     lists.bump(d, "a")
-/// #     assert d == {"a": 1}
+/// #     assert lists.doubled(xs) == [2, 4, 4] and xs == [1, 2, 2]
 /// # "#)?;
 /// # Ok::<(), orochi::Error>(())
 /// ```
+///
+/// # Fields
+///
+/// A `pub` field follows the same rules. A field of a Rust type is a value:
+/// reading it gives an immutable snapshot (`Vec<T>` and arrays a `tuple`,
+/// sets a `frozenset`, maps a read-only `types.MappingProxyType`, also
+/// nested; `Vec<u8>` is `bytes`), so `obj.items.append(1)` raises instead of
+/// changing a copy; assigning replaces the whole value. A snapshot does not
+/// compare equal to a list (`obj.items == [1]` is `False`); `list(...)`,
+/// `dict(...)` and `set(...)` give mutable copies (e.g. for `json`). Orochi
+/// references inside the value pass through, and a type with a hand-written
+/// [`IntoObject`] is handed over exactly as it builds it. A field of an orochi
+/// type is the Python object itself, mutable in place. A field cannot hold
+/// another class by value (it would be read as a copy, so `c.center.x = 5`
+/// would do nothing); use [`Ref<T>`] (`Vec<Ref<T>>`, ...) to share instances.
+/// Enums are fine by value: their members are immutable singletons.
 ///
 /// # Return values
 ///
@@ -272,12 +268,6 @@ pub use pyo3;
 /// `OSError` subclass) raises that exception, any other `E: Display` raises
 /// `RuntimeError(e.to_string())`. A panic raises
 /// `pyo3_runtime.PanicException`.
-///
-/// # Sharing objects: `Ref<T>`
-///
-/// A `pub` field cannot have another class as its type by value (it would be
-/// read as a copy, so `c.center.x = 5` would do nothing); use [`Ref<T>`] to
-/// share one instance. See [`Ref`].
 ///
 /// # Type stubs
 ///

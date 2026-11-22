@@ -55,35 +55,8 @@ impl Stubs {
     pub fn files(&self) -> BTreeMap<String, String> {
         let mut classes = HashMap::new();
         collect_classes(&self.root, self.root.name, &mut classes);
-        // The view classes are defined in the root stub, under names that
-        // its own items do not use.
-        let (_, root_names) = defined_names(&self.root);
-        let view_names = VIEW_KINDS
-            .iter()
-            .map(|kind| {
-                let mut name = (*kind).to_owned();
-                let mut n = 1;
-                while root_names.contains(name.as_str()) {
-                    n += 1;
-                    name = format!("{kind}_{n}");
-                }
-                (*kind, name)
-            })
-            .collect();
-        let tree = Tree {
-            root: self.root.name,
-            classes,
-            view_names,
-        };
         let mut out = BTreeMap::new();
-        let mut needed = BTreeSet::new();
-        render_tree(
-            &self.root,
-            self.root.name.to_owned(),
-            &tree,
-            &mut needed,
-            &mut out,
-        );
+        render_tree(&self.root, self.root.name.to_owned(), &classes, &mut out);
         out
     }
 }
@@ -328,19 +301,6 @@ impl Class {
 /// Qualified class name (`mylib.geometry.Square`) -> (module, class name).
 type ClassMap = HashMap<String, (String, String)>;
 
-/// The view classes the stubs may use, spelled `_orochi.<kind>` in hints
-/// (see `IntoObject::__view_hint`). They exist only for type checkers and
-/// are defined once, in the root module's stub.
-const VIEW_KINDS: [&str; 3] = ["ListView", "DictView", "SetView"];
-
-/// What every file of a module tree needs to know.
-struct Tree<'a> {
-    root: &'a str,
-    classes: ClassMap,
-    /// View kind -> its class name in the root stub.
-    view_names: BTreeMap<&'static str, String>,
-}
-
 fn collect_classes(module: &Module, full: &str, out: &mut ClassMap) {
     for item in &module.items {
         match item {
@@ -356,17 +316,10 @@ fn collect_classes(module: &Module, full: &str, out: &mut ClassMap) {
     }
 }
 
-/// Renders the stubs of `module` and its submodules into `out`, the root
-/// last: it defines the view classes that any file uses (`needed`).
-fn render_tree(
-    module: &Module,
-    full: String,
-    tree: &Tree<'_>,
-    needed: &mut BTreeSet<&'static str>,
-    out: &mut BTreeMap<String, String>,
-) {
+/// Renders the stubs of `module` and its submodules into `out`.
+fn render_tree(module: &Module, full: String, classes: &ClassMap, out: &mut BTreeMap<String, String>) {
     for sub in module.submodules() {
-        render_tree(sub, format!("{full}.{}", sub.name), tree, needed, out);
+        render_tree(sub, format!("{full}.{}", sub.name), classes, out);
     }
     let package = module.submodules().next().is_some();
     let base = full.replace('.', "/");
@@ -375,7 +328,7 @@ fn render_tree(
     } else {
         format!("{base}.pyi")
     };
-    out.insert(path, render_module(module, &full, tree, needed));
+    out.insert(path, render_module(module, &full, classes));
 }
 
 /// Builtins that hints may use bare; a stub defining one of these names
@@ -385,7 +338,7 @@ const KEYWORDS: &[&str] = &["None", "True", "False"];
 /// Per-file state: imports needed by the rendered hints.
 struct File<'a> {
     module: &'a str,
-    tree: &'a Tree<'a>,
+    classes: &'a ClassMap,
     /// Names defined at module level, which shadow a builtin of the same name
     /// everywhere in the file.
     defined: HashSet<&'a str>,
@@ -405,15 +358,13 @@ struct File<'a> {
     /// Class of this module -> private module-level alias, for class bodies
     /// where a member shadows the class name.
     class_aliases: BTreeMap<String, String>,
-    /// View kinds used in this file.
-    views: BTreeSet<&'static str>,
 }
 
 impl<'a> File<'a> {
-    fn new(module: &'a str, tree: &'a Tree<'a>, defined: HashSet<&'a str>) -> File<'a> {
+    fn new(module: &'a str, classes: &'a ClassMap, defined: HashSet<&'a str>) -> File<'a> {
         File {
             module,
-            tree,
+            classes,
             defined,
             members: HashSet::new(),
             reserved: HashSet::new(),
@@ -421,7 +372,6 @@ impl<'a> File<'a> {
             imports: BTreeMap::new(),
             from_imports: BTreeMap::new(),
             class_aliases: BTreeMap::new(),
-            views: BTreeSet::new(),
         }
     }
 
@@ -485,18 +435,7 @@ impl<'a> File<'a> {
 
     /// A (possibly dotted) name from a hint, as written in this file.
     fn name(&mut self, name: &str) -> String {
-        if let Some(kind) = name.strip_prefix("_orochi.")
-            && let Some(kind) = VIEW_KINDS.iter().copied().find(|k| *k == kind)
-        {
-            self.views.insert(kind);
-            let view = self.tree.view_names[kind].clone();
-            return if self.module == self.tree.root {
-                self.local_class(&view)
-            } else {
-                self.import_class(self.tree.root, &view)
-            };
-        }
-        if let Some((module, class)) = self.tree.classes.get(name) {
+        if let Some((module, class)) = self.classes.get(name) {
             if module == self.module {
                 return self.local_class(class);
             }
@@ -543,20 +482,6 @@ impl<'a> File<'a> {
                 out
             }
         }
-    }
-
-    /// Fills a template: every `{hint}` is rendered with [`File::hint`].
-    fn fill(&mut self, template: &str) -> String {
-        let mut out = String::new();
-        let mut rest = template;
-        while let Some(start) = rest.find('{') {
-            out.push_str(&rest[..start]);
-            let end = rest[start..].find('}').expect("closed `{`") + start;
-            out.push_str(&self.hint(&rest[start + 1..end]));
-            rest = &rest[end + 1..];
-        }
-        out.push_str(rest);
-        out
     }
 
     fn function(&mut self, f: &Function, indent: &str, kind: FnKind) -> String {
@@ -696,169 +621,7 @@ impl<'a> File<'a> {
         self.members.clear();
         out
     }
-
-    /// The `TypeVar`s and `@typing.type_check_only` classes of the views in
-    /// `kinds` (root module only).
-    fn view_classes(&mut self, kinds: &BTreeSet<&'static str>) -> (Vec<String>, Vec<String>) {
-        if kinds.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let templates: Vec<String> = VIEW_KINDS
-            .iter()
-            .filter(|kind| kinds.contains(*kind))
-            .map(|kind| {
-                let mut template = match *kind {
-                    "ListView" => LIST_VIEW,
-                    "DictView" => DICT_VIEW,
-                    _ => SET_VIEW,
-                }
-                .to_owned();
-                for kind in VIEW_KINDS {
-                    template = template.replace(&format!("${kind}"), &self.tree.view_names[kind]);
-                }
-                template
-            })
-            .collect();
-        // Type variables, declared if used: `$X` not followed by more of a name.
-        let used = |key: &str| {
-            let pattern = format!("${key}");
-            templates.iter().any(|t| {
-                t.match_indices(&pattern).any(|(i, _)| {
-                    !t[i + pattern.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
-                })
-            })
-        };
-        let type_var = self.name("typing.TypeVar");
-        let any = self.name("typing.Any");
-        let mut declarations = Vec::new();
-        let mut names: Vec<(String, String)> = Vec::new();
-        for (key, bound) in [
-            ("T", None),
-            ("I", None),
-            ("P", None),
-            ("K", None),
-            ("V", None),
-            ("S", None),
-            ("LV", Some(("ListView", 3))),
-            ("DV", Some(("DictView", 4))),
-        ] {
-            if !used(key) {
-                continue;
-            }
-            let name = self.fresh(&format!("_{key}"));
-            let bound = match bound {
-                Some((kind, args)) => {
-                    let view = self.local_class(&self.tree.view_names[kind].clone());
-                    format!(", bound={view}[{}]", vec![any.as_str(); args].join(", "))
-                }
-                None => String::new(),
-            };
-            declarations.push(format!("{name} = {type_var}(\"{name}\"{bound})"));
-            names.push((format!("${key}"), name));
-        }
-        // No key is a prefix of another, so the order does not matter.
-        let classes = templates
-            .into_iter()
-            .map(|mut template| {
-                for (key, name) in &names {
-                    template = template.replace(key, name);
-                }
-                self.fill(&template)
-            })
-            .collect();
-        (declarations, classes)
-    }
 }
-
-// `$X` are the generated names (type variables, view classes), `{...}` the
-// hints rendered for the file.
-
-const LIST_VIEW: &str = r#"@{typing.type_check_only}
-class $ListView({collections.abc.MutableSequence[$T]}, {typing.Generic[$T, $I, $P]}):
-    """A live view of a `Vec` field (only for type checkers): it changes the
-    field. Reads elements as `$T`, accepts `$T | $I`; `copy()` gives a plain
-    `list[$P]`."""
-
-    __hash__: {typing.ClassVar[None]}  # type: ignore[assignment]
-    def __len__(self) -> {int}: ...
-    @{typing.overload}
-    def __getitem__(self, index: {typing.SupportsIndex}) -> {$T}: ...
-    @{typing.overload}
-    def __getitem__(self, index: {slice}) -> {list[$T]}: ...
-    @{typing.overload}
-    def __setitem__(self, index: {typing.SupportsIndex}, value: {$T | $I}) -> None: ...
-    @{typing.overload}
-    def __setitem__(self, index: {slice}, value: {collections.abc.Iterable[$T | $I]}) -> None: ...
-    def __delitem__(self, index: {typing.SupportsIndex | slice}) -> None: ...
-    def insert(self, index: {typing.SupportsIndex}, value: {$T | $I}) -> None: ...
-    def append(self, value: {$T | $I}) -> None: ...
-    def extend(self, values: {collections.abc.Iterable[$T | $I]}) -> None: ...
-    def remove(self, value: {$T | $I}) -> None: ...
-    def __iadd__(self: {$LV}, values: {collections.abc.Iterable[$T | $I]}) -> {$LV}: ...  # type: ignore[misc]
-    def __imul__(self: {$LV}, n: {typing.SupportsIndex}) -> {$LV}: ...
-    def sort(self, *, key: {typing.Callable[[$T], typing.Any] | None} = None, reverse: {bool} = False) -> None: ...
-    def copy(self) -> {list[$P]}: ...
-    def __add__(self, other: {list[$P] | $ListView[$T, $I, $P]}) -> {list[$P]}: ...
-    def __radd__(self, other: {list[$P]}) -> {list[$P]}: ...
-    def __mul__(self, n: {typing.SupportsIndex}) -> {list[$P]}: ...
-    def __rmul__(self, n: {typing.SupportsIndex}) -> {list[$P]}: ...
-    def __lt__(self, other: {list[$P] | $ListView[$T, $I, $P]}) -> {bool}: ...
-    def __le__(self, other: {list[$P] | $ListView[$T, $I, $P]}) -> {bool}: ...
-    def __gt__(self, other: {list[$P] | $ListView[$T, $I, $P]}) -> {bool}: ...
-    def __ge__(self, other: {list[$P] | $ListView[$T, $I, $P]}) -> {bool}: ...
-    def __eq__(self, other: {object}) -> {bool}: ..."#;
-
-const DICT_VIEW: &str = r#"@{typing.type_check_only}
-class $DictView({collections.abc.MutableMapping[$K, $V]}, {typing.Generic[$K, $V, $I, $P]}):
-    """A live view of a map field (only for type checkers): it changes the
-    field. Reads values as `$V`, accepts `$V | $I`; `copy()` gives a plain
-    `dict[$K, $P]`."""
-
-    __hash__: {typing.ClassVar[None]}  # type: ignore[assignment]
-    def __len__(self) -> {int}: ...
-    def __iter__(self) -> {collections.abc.Iterator[$K]}: ...
-    def __getitem__(self, key: {$K}) -> {$V}: ...
-    def __setitem__(self, key: {$K}, value: {$V | $I}) -> None: ...
-    def __delitem__(self, key: {$K}) -> None: ...
-    def setdefault(self, key: {$K}, default: {$V | $I}) -> {$V}: ...  # pyright: ignore[reportIncompatibleMethodOverride]
-    @{typing.overload}
-    def update(self, m: {_typeshed.SupportsKeysAndGetItem[$K, $V | $I]}, **kwargs: {$V | $I}) -> None: ...
-    @{typing.overload}
-    def update(self, m: {collections.abc.Iterable[tuple[$K, $V | $I]]}, **kwargs: {$V | $I}) -> None: ...
-    @{typing.overload}
-    def update(self, **kwargs: {$V | $I}) -> None: ...
-    def copy(self) -> {dict[$K, $P]}: ...
-    def __or__(self, other: {dict[$K, $P] | $DictView[$K, $V, $I, $P]}) -> {dict[$K, $P]}: ...
-    def __ror__(self, other: {dict[$K, $P]}) -> {dict[$K, $P]}: ...
-    def __ior__(self: {$DV}, other: {_typeshed.SupportsKeysAndGetItem[$K, $V | $I] | collections.abc.Iterable[tuple[$K, $V | $I]]}) -> {$DV}: ...  # type: ignore[misc]
-    def __eq__(self, other: {object}) -> {bool}: ..."#;
-
-const SET_VIEW: &str = r#"@{typing.type_check_only}
-class $SetView({collections.abc.MutableSet[$T]}):
-    """A live view of a set field (only for type checkers): it changes the
-    field. `copy()` and the operators give a plain `set`."""
-
-    __hash__: {typing.ClassVar[None]}  # type: ignore[assignment]
-    def __len__(self) -> {int}: ...
-    def __iter__(self) -> {collections.abc.Iterator[$T]}: ...
-    def __contains__(self, x: {object}) -> {bool}: ...
-    def add(self, value: {$T}) -> None: ...
-    def discard(self, value: {$T}) -> None: ...
-    def copy(self) -> {set[$T]}: ...
-    def update(self, *others: {collections.abc.Iterable[$T]}) -> None: ...
-    def difference_update(self, *others: {collections.abc.Iterable[object]}) -> None: ...
-    def intersection_update(self, *others: {collections.abc.Iterable[object]}) -> None: ...
-    def symmetric_difference_update(self, other: {collections.abc.Iterable[$T]}) -> None: ...
-    def union(self, *others: {collections.abc.Iterable[$S]}) -> {set[$T | $S]}: ...
-    def intersection(self, *others: {collections.abc.Iterable[object]}) -> {set[$T]}: ...
-    def difference(self, *others: {collections.abc.Iterable[object]}) -> {set[$T]}: ...
-    def symmetric_difference(self, other: {collections.abc.Iterable[$S]}) -> {set[$T | $S]}: ...
-    def issubset(self, other: {collections.abc.Iterable[object]}) -> {bool}: ...
-    def issuperset(self, other: {collections.abc.Iterable[object]}) -> {bool}: ...
-    def __or__(self, other: {collections.abc.Set[$S]}) -> {set[$T | $S]}: ...
-    def __and__(self, other: {collections.abc.Set[object]}) -> {set[$T]}: ...
-    def __sub__(self, other: {collections.abc.Set[object]}) -> {set[$T]}: ...
-    def __xor__(self, other: {collections.abc.Set[$S]}) -> {set[$T | $S]}: ..."#;
 
 #[derive(Clone, Copy)]
 enum FnKind {
@@ -947,19 +710,10 @@ fn defined_names(module: &Module) -> (HashSet<&str>, HashSet<&str>) {
     (defined, all)
 }
 
-fn render_module(
-    module: &Module,
-    full: &str,
-    tree: &Tree<'_>,
-    needed: &mut BTreeSet<&'static str>,
-) -> String {
-    let is_root = full == tree.root;
+fn render_module(module: &Module, full: &str, classes: &ClassMap) -> String {
     let (defined, all_defined) = defined_names(module);
-    let mut file = File::new(full, tree, defined);
+    let mut file = File::new(full, classes, defined);
     file.reserved = all_defined.iter().map(|n| (*n).to_owned()).collect();
-    if is_root {
-        file.reserved.extend(tree.view_names.values().cloned());
-    }
 
     let mut blocks: Vec<String> = Vec::new();
     let mut submodules: Vec<&str> = Vec::new();
@@ -983,14 +737,6 @@ fn render_module(
             Item::Module(m) => submodules.push(m.name),
         }
     }
-    needed.extend(file.views.iter().copied());
-    let (type_vars, view_classes) = if is_root {
-        let kinds = needed.clone();
-        file.view_classes(&kinds)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
     let mut intro = String::from(HEADER);
     if let Some(doc) = docstring(module.doc, "") {
         intro.push('\n');
@@ -1018,14 +764,12 @@ fn render_module(
     for (module, names) in by_module {
         header.push(format!("from {module} import {}", names.join(", ")));
     }
-    // Private names: class aliases (see `File::local_class`), type variables.
-    let mut private: Vec<String> = file
+    // Private names: class aliases (see `File::local_class`).
+    let private: Vec<String> = file
         .class_aliases
         .iter()
         .map(|(class, alias)| format!("{alias} = {class}"))
         .collect();
-    private.extend(type_vars);
-    blocks.extend(view_classes);
     // Single-line items stay together; multi-line ones get blank lines.
     let mut items = String::new();
     let mut previous_multiline = false;
@@ -1291,20 +1035,16 @@ fn render_node(node: &Node) -> String {
 mod tests {
     use super::*;
 
-    fn tree() -> Tree<'static> {
+    fn classes() -> ClassMap {
         let mut classes = ClassMap::new();
         classes.insert("m.P".into(), ("m".into(), "P".into()));
         classes.insert("m.sub.Q".into(), ("m.sub".into(), "Q".into()));
-        Tree {
-            root: "m",
-            classes,
-            view_names: VIEW_KINDS.iter().map(|k| (*k, (*k).to_owned())).collect(),
-        }
+        classes
     }
 
     fn hint(defined: &[&'static str], text: &str) -> (String, Vec<String>) {
-        let tree = tree();
-        let mut file = File::new("m", &tree, defined.iter().copied().collect());
+        let classes = classes();
+        let mut file = File::new("m", &classes, defined.iter().copied().collect());
         file.reserved = defined.iter().map(|n| (*n).to_owned()).collect();
         let out = file.hint(text);
         let mut imports: Vec<String> = file

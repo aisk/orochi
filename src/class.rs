@@ -171,7 +171,6 @@ impl<T: Class> IntoObject for &Ref<T> {
 
 /// Accepts an instance of `T` (or a subclass) without copying it.
 impl<T: Class> FromObject for Ref<T> {
-    const REFERENCES_PYTHON: bool = true;
     fn from_object(obj: &Object) -> Result<Self> {
         attach(|py| {
             let b = obj.bind(py);

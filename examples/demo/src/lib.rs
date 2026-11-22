@@ -5,6 +5,7 @@
 #[orochi::module]
 mod demo {
     #![doc = concat!("Demo extension module ", "built with orochi.")]
+    use orochi::prelude::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -22,10 +23,10 @@ mod demo {
         std::fs::read_to_string(path)
     }
 
-    /// Appends `v` twice, in place.
-    pub fn push_twice(xs: &mut Vec<i64>, v: i64) {
-        xs.push(v);
-        xs.push(v);
+    /// Appends `v` twice to the caller's list.
+    pub fn push_twice(xs: List<i64>, v: i64) -> Result<()> {
+        xs.push(v)?;
+        xs.push(v)
     }
 
     pub fn word_counts(text: &str) -> HashMap<String, usize> {
@@ -65,12 +66,16 @@ mod demo {
         }
     }
 
-    /// Container fields are live views from Python.
+    /// A value field next to a reference field.
     #[derive(Default)]
     pub struct Basket {
-        pub items: Vec<String>,
-        pub numbers: Vec<i64>,
+        /// A value: Python reads an immutable snapshot (a tuple); assign to
+        /// replace it.
+        pub items: Vec<i64>,
+        /// Also a value: a read-only mapping of tuples.
         pub table: HashMap<String, Vec<i64>>,
+        /// A reference: a real Python list, mutable in place.
+        pub tags: List<String>,
     }
 
     impl Basket {
@@ -78,8 +83,12 @@ mod demo {
             Basket::default()
         }
 
+        pub fn add_item(&mut self, item: i64) {
+            self.items.push(item);
+        }
+
         pub fn count(&self) -> usize {
-            self.items.len() + self.numbers.len() + self.table.values().map(Vec::len).sum::<usize>()
+            self.items.len() + self.table.values().map(Vec::len).sum::<usize>() + self.tags.len()
         }
     }
 

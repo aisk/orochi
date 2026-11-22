@@ -20,7 +20,7 @@ use crate::object::Object;
 use crate::runtime::attach;
 
 macro_rules! handle_common {
-    ($name:ident <$($p:ident),+>, $pytype:ty, $pyname:literal, in: $in_hint:expr, out: $out_hint:expr, stored_in: $stored_in_hint:expr) => {
+    ($name:ident <$($p:ident),+>, $pytype:ty, $pyname:literal, in: $in_hint:expr, out: $out_hint:expr) => {
         impl<$($p),+> $name<$($p),+> {
             /// The handle as an untyped [`Object`] (same Python object).
             pub fn as_object(&self) -> &Object {
@@ -76,9 +76,6 @@ macro_rules! handle_common {
             fn output_hint() -> String {
                 $out_hint
             }
-            fn __input_hint() -> String {
-                $stored_in_hint
-            }
         }
 
         /// Passes the referenced object itself (no copy).
@@ -93,8 +90,6 @@ macro_rules! handle_common {
 
         #[doc = concat!("Accepts a `", $pyname, "` (or subclass) without copying it. Elements are not checked until accessed.")]
         impl<$($p: FromObject),+> FromObject for $name<$($p),+> {
-            const REFERENCES_PYTHON: bool = true;
-            const __HANDLE_OF: Option<&'static str> = Some($pyname);
             fn from_object(obj: &Object) -> Result<Self> {
                 attach(|py| {
                     let b = obj.bind(py);
@@ -134,8 +129,7 @@ pub struct List<T> {
 
 handle_common!(List<T>, PyList, "list",
     in: format!("list[{}]", T::input_hint()),
-    out: format!("list[{}]", T::output_hint()),
-    stored_in: format!("list[{}]", T::__input_hint()));
+    out: format!("list[{}]", T::output_hint()));
 
 impl<T> List<T> {
     /// Creates a new empty Python `list`.
@@ -250,8 +244,7 @@ pub struct Dict<K, V> {
 
 handle_common!(Dict<K, V>, PyDict, "dict",
     in: format!("dict[{}, {}]", K::input_hint(), V::input_hint()),
-    out: format!("dict[{}, {}]", K::output_hint(), V::output_hint()),
-    stored_in: format!("dict[{}, {}]", K::__input_hint(), V::__input_hint()));
+    out: format!("dict[{}, {}]", K::output_hint(), V::output_hint()));
 
 impl<K, V> Dict<K, V> {
     /// Creates a new empty Python `dict`.
@@ -389,8 +382,7 @@ pub struct Set<T> {
 
 handle_common!(Set<T>, PySet, "set",
     in: format!("set[{}]", T::input_hint()),
-    out: format!("set[{}]", T::output_hint()),
-    stored_in: format!("set[{}]", T::__input_hint()));
+    out: format!("set[{}]", T::output_hint()));
 
 impl<T> Set<T> {
     /// Creates a new empty Python `set`.

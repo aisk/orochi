@@ -25,19 +25,17 @@ same = p == Point(6, 4)
 
 b = Basket()
 other = Basket()
-b.items.append("apple")
-b.items += ["pear", "fig"]
-b.items.sort()
-b.table.setdefault("k", []).append(1)
-b.table["k"] += [2]
-demo.push_twice(b.numbers, 7)  # a field's view works where `&mut Vec` is expected
-b.items = ["plum"]
+b.tags.append("x")  # a `List<str>` field is the Python list itself
+demo.push_twice([1], 7)
+b.items = [1, 2]  # a value field is replaced as a whole
+b.items = b.items  # its snapshot is accepted back
 b.table = {"k": [1, 2]}
-b.table = other.table  # copies the other basket's table
-b.numbers = other.numbers
-first: str = b.items[0]
-plain: list[str] = b.items.copy()
-table: dict[str, list[int]] = b.table.copy()
+b.table = other.table
+first: int = b.items[0]
+items: tuple[int, ...] = b.items
+mutable: list[int] = list(b.items)
+row: tuple[int, ...] = b.table["k"]
+tags: list[str] = b.tags
 
 c: Color = demo.favorite()
 red = c is Color.Red or c == Color.Green
