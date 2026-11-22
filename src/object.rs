@@ -8,6 +8,8 @@ use pyo3::types::{PyDict, PyIterator, PyTuple};
 use crate::args::{IntoArgs, IntoKwargs};
 use crate::convert::{FromObject, IntoObject};
 use crate::error::{Error, Result};
+use crate::function::{Signature, new_function};
+use crate::handler::{Handler, Ret};
 use crate::runtime::{attach, try_attach};
 
 /// A reference to any Python object.
@@ -61,11 +63,19 @@ impl Object {
 
     /// Wraps a Rust closure as a Python callable.
     ///
-    /// The closure may take up to 8 arguments of any [`FromObject`] type and
-    /// return any [`IntoObject`] type (including [`Result`](crate::Result)).
-    /// Arguments are converted strictly; a wrong argument count or keyword
-    /// arguments raise `TypeError`, and a failed argument conversion raises
-    /// the conversion error with a note naming the argument.
+    /// The closure's parameters and return type are those of functions
+    /// exported with [`ModuleBuilder`](crate::ModuleBuilder): up to 12
+    /// parameters of any [`Arg`](crate::Arg) type (`i64`, `String`, `&str`,
+    /// `Option<T>`, [`List<T>`](crate::List), `&T` of a class, ...), and any
+    /// [`Ret`](crate::Ret) type, including [`Result`](crate::Result).
+    ///
+    /// The parameters have no names: they are passed positionally and are
+    /// called `arg1`, `arg2`, ... in error messages. Trailing `Option`
+    /// parameters may be omitted (they are `None`). Arguments are converted
+    /// strictly; a wrong argument count or any keyword argument raises
+    /// `TypeError`. A failed conversion names the argument: a `TypeError`
+    /// becomes `TypeError("argument 'arg2': ...")` with the original as its
+    /// cause, other exceptions keep their type and get a note.
     ///
     /// A Rust panic inside the closure does not unwind through Python: it is
     /// raised as `pyo3_runtime.PanicException` (a `BaseException`), and if
@@ -90,11 +100,22 @@ impl Object {
     /// # Panics
     ///
     /// Panics if Python fails to allocate the function object.
-    pub fn from_fn<F, Marker>(f: F) -> Object
+    pub fn from_fn<M, R, F>(f: F) -> Object
     where
-        F: crate::callable::IntoPyFunction<Marker>,
+        F: Handler<M>,
+        F::Output: Ret<R>,
     {
-        crate::callable::make_function(f)
+        attach(|py| {
+            let name = "<closure>";
+            let function = Signature::positional_only(name.to_owned(), F::OPTIONAL)
+                .and_then(|sig| {
+                    new_function(py, name, "orochi", "", sig, move |py, args, names| {
+                        f.call(args, names)?.ret(py)
+                    })
+                })
+                .expect("failed to create a Python function object");
+            Object::from_bound(function)
+        })
     }
 
     /// Reads attribute `name` (Python's `obj.name`).

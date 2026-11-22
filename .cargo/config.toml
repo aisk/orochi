@@ -1,9 +1,0 @@
-[build]
-incremental = false
-
-# Keep local build caches small: no debug info for dev/test builds.
-[profile.dev]
-debug = false
-
-[profile.test]
-debug = false

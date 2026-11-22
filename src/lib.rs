@@ -102,7 +102,6 @@
 
 mod args;
 mod builder;
-mod callable;
 mod class;
 mod convert;
 mod error;
@@ -115,8 +114,6 @@ mod runtime;
 
 pub use args::{Args, IntoArgs, IntoKwargs, Kwargs};
 pub use builder::{ClassBuilder, Field, ModuleBuilder, construct, init_module, load_module};
-#[doc(hidden)]
-pub use callable::IntoPyFunction;
 pub use class::{Class, Ref, RefGuard, RefMutGuard};
 pub use convert::{FromObject, IntoObject};
 pub use error::{Error, Result};

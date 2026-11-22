@@ -86,7 +86,7 @@ where
         Function {
             qualname: qualname.clone(),
             call: Box::new(move |args, kwargs| {
-                let bound = sig.binder().bind(args, kwargs)?;
+                let bound = sig.bind(args, kwargs)?;
                 call(args.py(), &bound, &sig.names)
             }),
         },
@@ -120,6 +120,8 @@ pub(crate) struct Signature {
     /// The Rust parameter names, `self` first for methods.
     pub(crate) names: Vec<String>,
     required: usize,
+    /// Keyword arguments are rejected (the names are made up).
+    positional_only: bool,
 }
 
 impl Signature {
@@ -150,14 +152,35 @@ impl Signature {
             names.push((*param).to_owned());
         }
         let required = required(optional, first);
-        Ok(Signature { qualname, method, names, required })
+        Ok(Signature { qualname, method, names, required, positional_only: false })
     }
 
-    pub(crate) fn binder(&self) -> Binder<'_, String> {
+    /// A function whose parameters have no names (a Rust closure): they
+    /// are called `arg1`, `arg2`, ... in messages and can only be passed
+    /// positionally.
+    pub(crate) fn positional_only(qualname: String, optional: &[bool]) -> PyResult<Self> {
+        let names: Vec<String> = (1..=optional.len()).map(|i| format!("arg{i}")).collect();
+        let params: Vec<&str> = names.iter().map(String::as_str).collect();
+        Ok(Signature { positional_only: true, ..Signature::new(qualname, false, &params, optional)? })
+    }
+
+    fn binder(&self) -> Binder<'_, String> {
         Binder { qualname: &self.qualname, method: self.method, names: &self.names, required: self.required }
     }
 
-    /// `__text_signature__`: `(a, b=None)`, `($self, k)`.
+    /// Binds one call's arguments to the parameters.
+    fn bind<'py>(
+        &self,
+        args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<BoundArgs<'py>> {
+        if self.positional_only && kwargs.is_some_and(|kw| !kw.is_empty()) {
+            return Err(PyTypeError::new_err(format!("{}() takes no keyword arguments", self.qualname)));
+        }
+        self.binder().bind(args, kwargs)
+    }
+
+    /// `__text_signature__`: `(a, b=None)`, `($self, k)`, `(arg1, /)`.
     fn text(&self) -> String {
         let first = usize::from(self.method);
         let mut parts = Vec::with_capacity(self.names.len());
@@ -166,6 +189,9 @@ impl Signature {
         }
         for (i, name) in self.names.iter().enumerate().skip(first) {
             parts.push(if i < self.required { name.clone() } else { format!("{name}=None") });
+        }
+        if self.positional_only && !parts.is_empty() {
+            parts.push("/".to_owned());
         }
         format!("({})", parts.join(", "))
     }

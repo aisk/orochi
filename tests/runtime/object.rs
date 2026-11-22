@@ -282,6 +282,11 @@ fn from_fn_round_trip() -> Result<()> {
     assert!(scope.eval("nothing()")?.is_none());
     assert_eq!(scope.eval("summarize([1, 2.5], None)")?.to::<f64>()?, 3.5);
     assert_eq!(scope.eval("summarize((1, 2), 10)")?.to::<f64>()?, 30.0);
+    // A trailing `Option` may be omitted.
+    assert_eq!(scope.eval("summarize([4])")?.to::<f64>()?, 4.0);
+    // Borrowed parameters work as in exported functions.
+    scope.set("shout", Object::from_fn(|s: &str| s.to_uppercase()))?;
+    assert_eq!(scope.eval("shout('hi')")?.to::<String>()?, "HI");
     assert_eq!(scope.eval("list(map(add, [1, 2], [10, 20]))")?.to::<Vec<i64>>()?, [11, 22]);
 
     // Captured state and many arguments.
@@ -310,10 +315,22 @@ fn from_fn_errors() -> Result<()> {
 
     let err = add.call(1).unwrap_err();
     assert!(err.is_instance_of("TypeError"));
-    assert!(err.message().contains("takes 2 positional arguments but 1 was given"), "{err}");
+    assert_eq!(err.message(), "<closure>() missing 1 required positional argument: 'arg2'");
 
     let err = add.call_kw((1, 2), kwargs! { "c" => 3 }).unwrap_err();
     assert!(err.is_instance_of("TypeError"));
+    assert!(err.message().contains("takes no keyword arguments"), "{err}");
+
+    // The made-up parameter names cannot be used as keywords either.
+    let err = add.call_kw(1, kwargs! { "arg2" => 2 }).unwrap_err();
+    assert!(err.is_instance_of("TypeError"));
+    assert!(err.message().contains("takes no keyword arguments"), "{err}");
+
+    // Too many arguments, and the signature `inspect` sees.
+    let err = add.call((1, 2, 3)).unwrap_err();
+    assert!(err.message().contains("takes 2 positional arguments but 3 were given"), "{err}");
+    let signature = eval("__import__('inspect').signature")?.call(&add)?;
+    assert_eq!(signature.to_string(), "(arg1, arg2, /)");
 
     let fallible = Object::from_fn(|x: i64| -> Result<i64> {
         if x < 0 {
@@ -351,19 +368,22 @@ fn from_fn_errors() -> Result<()> {
 fn from_fn_argument_errors_keep_original() -> Result<()> {
     let notes = |err: &Error| -> Result<Vec<String>> { err.value().attr("__notes__")?.to() };
 
-    // A TypeError from strict conversion keeps its message; context is a note.
+    // A TypeError from strict conversion is reraised naming the argument,
+    // with the original as its cause.
     let add = Object::from_fn(|a: i64, b: i64| a + b);
     let err = add.call((1, "x")).unwrap_err();
     assert_eq!(err.type_name(), "TypeError");
-    assert_eq!(err.message(), "expected int, got str");
-    assert_eq!(notes(&err)?, ["while converting argument 2 of a Rust function"]);
-    assert!(format!("{err:#}").contains("while converting argument 2"));
+    assert_eq!(err.message(), "argument 'arg2': expected int, got str");
+    let cause = err.value().attr("__cause__")?;
+    assert_eq!(cause.type_name(), "TypeError");
+    assert_eq!(cause.str()?, "expected int, got str");
 
-    // Other exception types get the same context and keep their type.
+    // Other exception types keep their type and get the context as a note.
     let small = Object::from_fn(|x: u8| x);
     let err = small.call(300).unwrap_err();
     assert_eq!(err.type_name(), "OverflowError");
-    assert_eq!(notes(&err)?, ["while converting argument 1 of a Rust function"]);
+    assert_eq!(notes(&err)?, ["while converting argument 'arg1'"]);
+    assert!(format!("{err:#}").contains("while converting argument 'arg1'"));
 
     // An exception raised by user code during conversion (here `__index__`)
     // is the very same object, with its traceback.
@@ -380,7 +400,7 @@ fn from_fn_argument_errors_keep_original() -> Result<()> {
     assert_eq!(caught.type_name(), "Boom");
     assert_eq!(caught.str()?, "index failed");
     assert!(scope.get("has_tb")?.to::<bool>()?);
-    assert_eq!(caught.attr("__notes__")?.to::<Vec<String>>()?, ["while converting argument 1 of a Rust function"]);
+    assert_eq!(caught.attr("__notes__")?.to::<Vec<String>>()?, ["while converting argument 'arg1'"]);
     Ok(())
 }
 

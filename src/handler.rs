@@ -103,6 +103,8 @@ fn convert<T: FromObject>(obj: Option<&Bound<'_, PyAny>>, name: &str) -> PyResul
 /// Converts `obj` with [`FromObject`], naming it in the error with `what()`
 /// (`argument 'x'`): a `TypeError` becomes `TypeError("argument 'x': ...")`
 /// with the original as its cause, other exceptions get a note.
+///
+/// This is the one place that says which argument failed to convert.
 pub(crate) fn convert_named<T: FromObject>(
     obj: &Bound<'_, PyAny>,
     what: impl FnOnce() -> String,
@@ -110,15 +112,38 @@ pub(crate) fn convert_named<T: FromObject>(
     T::from_object(&Object::from_bound(obj.clone())).map_err(|err| {
         let (py, err, what) = (obj.py(), err.into_pyerr(), what());
         if err.is_instance_of::<PyTypeError>(py) {
-            let message = err.value(py).str().map(|s| s.to_string()).unwrap_or_default();
-            let new = PyTypeError::new_err(format!("{what}: {message}"));
+            let new = PyTypeError::new_err(format!("{what}: {}", message(py, &err)));
             new.set_cause(py, Some(err));
             new
         } else {
-            let _ = err.value(py).call_method1("add_note", (format!("while converting {what}"),));
-            err
+            add_note(py, err, format!("while converting {what}"))
         }
     })
+}
+
+/// Adds `note` to `err` with `BaseException.add_note` (Python 3.11+).
+/// Before 3.11, raises a new exception of the same type, `"{note}: {message}"`,
+/// with `err` as its cause; if that type cannot be built from one message,
+/// `err` is kept unchanged.
+fn add_note(py: Python<'_>, err: PyErr, note: String) -> PyErr {
+    let value = err.value(py).clone();
+    if py.version_info() >= (3, 11) {
+        let _ = value.call_method1("add_note", (note,));
+        return err;
+    }
+    match value.get_type().call1((format!("{note}: {}", message(py, &err)),)) {
+        Ok(new) => {
+            let new = PyErr::from_value(new);
+            new.set_cause(py, Some(err));
+            new
+        }
+        Err(_) => err,
+    }
+}
+
+/// `str(err)`, or an empty string if that fails.
+fn message(py: Python<'_>, err: &PyErr) -> String {
+    err.value(py).str().map(|s| s.to_string()).unwrap_or_default()
 }
 
 /// The instance of class `T` passed as argument `name`.
