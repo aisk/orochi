@@ -108,7 +108,7 @@ The [reference](docs/reference.md) describes everything in detail:
 crate-type = ["cdylib"]
 
 [dependencies]
-orochi = "..."
+orochi = "0.1"
 ```
 
 Build it with [maturin](https://www.maturin.rs) (`maturin develop`), or by
@@ -122,7 +122,7 @@ the module name. [`examples/demo`](examples/demo) is a complete example:
 
 The same types work the other way round, inside an extension or in a Rust
 program that embeds Python (enable the `embed` feature for that:
-`orochi = { version = "...", features = ["embed"] }`):
+`orochi = { version = "0.1", features = ["embed"] }`):
 
 ```rust
 use orochi::prelude::*;
