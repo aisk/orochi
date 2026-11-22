@@ -431,8 +431,7 @@ fn type_hints() {
     // Keys read back as `pathlib.Path`; `Mapping` is invariant in its keys.
     assert_eq!(
         <HashMap<PathBuf, i64> as FromObject>::input_hint(),
-        "collections.abc.Mapping[str | os.PathLike[str], int] \
-         | collections.abc.Mapping[pathlib.Path, int]"
+        "collections.abc.Mapping[str | os.PathLike[str], int]"
     );
     assert_eq!(<HashSet<i64> as IntoObject>::output_hint(), "set[int]");
     assert_eq!(<HashSet<i64> as FromObject>::input_hint(), "set[int] | frozenset[int]");

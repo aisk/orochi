@@ -204,17 +204,6 @@ pub trait FromObject: Sized {
     fn __vec_input_hint() -> String {
         format!("collections.abc.Sequence[{}]", Self::input_hint())
     }
-
-    /// What Python reads back for this type (from a field), when that is
-    /// typed differently from [`input_hint`](FromObject::input_hint):
-    /// `pathlib.Path` for paths. Used for `Mapping` keys, which are invariant.
-    #[doc(hidden)]
-    fn __read_back_hint() -> Option<String>
-    where
-        Self: Sized,
-    {
-        None
-    }
 }
 
 /// Builds the standard "wrong type" error.
@@ -671,9 +660,6 @@ impl FromObject for PathBuf {
     fn input_hint() -> String {
         "str | os.PathLike[str]".to_owned()
     }
-    fn __read_back_hint() -> Option<String> {
-        Some("pathlib.Path".to_owned())
-    }
 }
 
 // ---------------------------------------------------------------- None / Option
@@ -875,16 +861,12 @@ fn pairs_from_mapping<K: FromObject, V: FromObject>(
     })
 }
 
-/// `Mapping` is invariant in its key type, so when the keys Python reads
-/// back are typed differently from what the key conversion accepts
-/// (`pathlib.Path` vs `str | os.PathLike[str]`), both mappings are listed.
 fn mapping_input_hint<K: FromObject, V: FromObject>() -> String {
-    let value = V::input_hint();
-    let hint = format!("collections.abc.Mapping[{}, {value}]", K::input_hint());
-    match K::__read_back_hint() {
-        Some(key) => format!("{hint} | collections.abc.Mapping[{key}, {value}]"),
-        None => hint,
-    }
+    format!(
+        "collections.abc.Mapping[{}, {}]",
+        K::input_hint(),
+        V::input_hint()
+    )
 }
 
 fn set_from_items<T: IntoObject>(items: impl IntoIterator<Item = T>) -> Result<Object> {

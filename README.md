@@ -288,7 +288,11 @@ members are `Final` attributes of their class.
 
 Stubs are looser than the runtime in places: an integer or string type only
 says `int` / `str` (not the range of a `u8`, say), and a custom conversion is
-only as precise as its hint. A custom `FromObject` / `IntoObject` hint is used
+only as precise as its hint. In one place they are stricter: a map whose keys
+are paths (`HashMap<PathBuf, V>`) accepts `Mapping[str | os.PathLike[str], V]`
+but reads back with `pathlib.Path` keys, and since `Mapping` is invariant in
+its key type, a type checker rejects passing the read-back mapping in again
+(`b.by_path = b.by_path`) although it works at runtime. A custom `FromObject` / `IntoObject` hint is used
 as written: spell names fully qualified (`typing.Any`,
 `numpy.typing.NDArray[numpy.float64]`) and the stub imports their modules.
 

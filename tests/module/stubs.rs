@@ -328,10 +328,8 @@ fn field_hints() {
             "    def points(self) -> tuple[Point, ...]: ...",
             "    def blobs(self) -> tuple[bytes, ...]: ...",
             "    def colors(self) -> tuple[Color, ...]: ...",
-            // `Mapping` keys are invariant: what is read back is accepted too.
             "    def by_path(self) -> types.MappingProxyType[pathlib.Path, int]: ...",
-            "    def by_path(self, value: collections.abc.Mapping[str | os.PathLike[str], int] \
-             | collections.abc.Mapping[pathlib.Path, int]) -> None: ...",
+            "    def by_path(self, value: collections.abc.Mapping[str | os.PathLike[str], int]) -> None: ...",
         ],
     );
     // orochi reference types are the objects themselves.
