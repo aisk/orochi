@@ -21,9 +21,9 @@ impl std::fmt::Display for Account {
 #[pymethods(crate = "orochi::pyo3")]
 impl Account {
     #[new]
-    #[pyo3(signature = (*args, **kwargs), text_signature = "(owner)")]
+    #[pyo3(signature = (*args, **kwargs), text_signature = None)]
     fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        orochi::construct(&["owner"], |owner: String| Account { owner, cents: 0 }, args, kwargs)
+        orochi::construct(args, kwargs)
     }
 }
 
@@ -36,9 +36,7 @@ impl Vault {
     #[new]
     #[pyo3(signature = (*args, **kwargs))]
     fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        orochi::construct(&["code"], |code: i64| -> Result<Vault> {
-            if code == 42 { Ok(Vault) } else { Err(orochi::Error::value_error("wrong code")) }
-        }, args, kwargs)
+        orochi::construct(args, kwargs)
     }
 }
 
@@ -55,6 +53,7 @@ fn init(m: &ModuleBuilder<'_>) -> Result<()> {
         Ok(())
     })?;
     let c: ClassBuilder<'_, Account> = m.class::<Account>()?;
+    c.constructor(&["owner"], "", |owner: String| Account { owner, cents: 0 })?;
 
     c.method("deposit", &["cents"], "Adds money.", |a: &mut Account, cents: i64| -> Result<()> {
         if cents <= 0 {
@@ -79,6 +78,9 @@ fn init(m: &ModuleBuilder<'_>) -> Result<()> {
     c.repr_debug()?.str_display()?.eq()?.hash()?;
     // Chaining from the temporary, and binding the result.
     let v = m.class::<Vault>()?.static_method("hint", &[], "", || 42)?;
+    v.constructor(&["code"], "", |code: i64| -> Result<Vault> {
+        if code == 42 { Ok(Vault) } else { Err(orochi::Error::value_error("wrong code")) }
+    })?;
     v.constant("NAME", "vault")?;
     m.submodule("util", "Helpers.", |sub| {
         sub.function("double", &["x"], "", |x: f64| x * 2.0)?;
@@ -131,6 +133,8 @@ fn hand_written_module() {
         assert str(inspect.signature(A.transfer)) == "(self, /, to, cents)"
         import bank.util
         assert bank.util.double(2) == 4.0 and bank.util.__doc__ == "Helpers."
+        # `__signature__` wins over the `(*args, **kwargs)` pyo3 generates.
+        assert str(inspect.signature(bank.Vault)) == "(code)", inspect.signature(bank.Vault)
         assert bank.Vault(code=42) is not None and bank.Vault.hint() == 42 and bank.Vault.NAME == "vault"
         try:
             bank.Vault(1)
@@ -153,6 +157,27 @@ fn hand_written_module() {
 /// Only used to check build-time errors.
 #[pyclass(crate = "orochi::pyo3")]
 struct Probe;
+
+#[pymethods(crate = "orochi::pyo3")]
+impl Probe {
+    #[new]
+    #[pyo3(signature = (*args, **kwargs), text_signature = None)]
+    fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        orochi::construct(args, kwargs)
+    }
+}
+
+#[test]
+fn constructor_must_be_registered() {
+    orochi::load_module("unregistered", |m| {
+        m.class::<Probe>()?;
+        Ok(())
+    })
+    .unwrap();
+    let err = orochi::exec("import unregistered; unregistered.Probe()").unwrap_err();
+    assert!(err.is_instance_of("TypeError"), "{err}");
+    assert!(err.message().contains("cannot create 'Probe' instances"), "{err}");
+}
 
 #[test]
 fn bad_signatures_fail_at_build_time() {
@@ -183,4 +208,11 @@ fn parameter_name_count_must_match() {
     .unwrap_err();
     assert!(err.is_instance_of("TypeError"), "{err}");
     assert!(err.message().contains("1 parameter names given for a Rust function with 2 parameters"), "{err}");
+    // Checked once, when the constructor is registered.
+    let err = orochi::load_module("bad_ctor", |m| {
+        m.class::<Probe>()?.constructor(&["a", "b"], "", |_a: i64| Probe)?;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.message().contains("Probe: 2 parameter names given for a Rust function with 1 parameters"), "{err}");
 }

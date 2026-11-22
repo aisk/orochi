@@ -16,8 +16,8 @@ use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, FnArg, GenericArgument, Ident, ImplItem, Item, ItemImpl, ItemMod,
-    ItemStruct, LitStr, Pat, Path, PathArguments, ReturnType, Signature, Token, Type, Visibility,
+    Attribute, FnArg, GenericArgument, Ident, ImplItem, Item, ItemImpl, ItemMod, ItemStruct, LitStr,
+    Pat, Path, PathArguments, PathSegment, ReturnType, Signature, Token, Type, Visibility,
 };
 
 /// Turns an inline Rust module into a Python extension module.
@@ -163,8 +163,6 @@ struct Class {
     eq: bool,
     hash: bool,
     has_ctor: bool,
-    /// The constructor's doc comment, appended to the class doc.
-    ctor_doc: Vec<Attribute>,
     names: Names,
     calls: Vec<TokenStream2>,
     /// Items emitted next to the struct (the constructor's #[pymethods]).
@@ -223,24 +221,6 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, path: &str) -> ItemMod {
             );
         }
     }
-    // The constructor's doc comment goes to the class doc (shown by `help`).
-    let mut items = items;
-    for class in &classes {
-        if class.ctor_doc.is_empty() {
-            continue;
-        }
-        for item in &mut items {
-            if let Item::Struct(s) = item
-                && s.ident == class.ident
-            {
-                if s.attrs.iter().any(|a| a.path().is_ident("doc")) {
-                    s.attrs.push(syn::parse_quote!(#[doc = ""]));
-                }
-                s.attrs.extend(class.ctor_doc.iter().cloned());
-            }
-        }
-    }
-
     for item in items {
         match &item {
             Item::Fn(f) if is_pub(&f.vis) => {
@@ -273,13 +253,13 @@ fn process_module(cx: &mut Cx, mut item_mod: ItemMod, path: &str) -> ItemMod {
                 if !c.generics.params.is_empty() {
                     cx.error(&c.generics, "generic constants cannot be exported to Python");
                 }
-                calls.extend(constant(cx, &mut names, &c.ident, &c.attrs, &c.ty, quote!(__orochi_m), quote!(self)));
+                calls.push(constant(cx, &mut names, &c.ident, &c.attrs, &c.ty, quote!(__orochi_m), quote!(self)));
             }
             Item::Static(s) if is_pub(&s.vis) => {
                 if let syn::StaticMutability::Mut(_) = s.mutability {
                     cx.error(s, "`pub static mut` cannot be exported to Python; make it private");
                 } else {
-                    calls.extend(constant(cx, &mut names, &s.ident, &s.attrs, &s.ty, quote!(__orochi_m), quote!(self)));
+                    calls.push(constant(cx, &mut names, &s.ident, &s.attrs, &s.ty, quote!(__orochi_m), quote!(self)));
                 }
             }
             Item::Enum(e) if is_pub(&e.vis) => cx.error(
@@ -349,22 +329,24 @@ fn constant(
     ty: &Type,
     builder: TokenStream2,
     owner: TokenStream2,
-) -> Option<TokenStream2> {
+) -> TokenStream2 {
     let name = ident.unraw().to_string();
     check_python_name(cx, &name, ident, "constant");
     names.add(cx, &name, ident, "namespace");
     let cfg = cfg_attrs(attrs);
-    Some(quote_spanned! {ty.span()=>
+    quote_spanned! {ty.span()=>
         #(#cfg)* #builder.constant(#name, ::core::clone::Clone::clone(&#owner::#ident))?;
-    })
+    }
 }
 
 /// The class an `impl` block is for, if its self type names a class of this
 /// module (`Point` or `self::Point`).
 fn impl_target<'a>(classes: &'a mut [Class], self_ty: &Type) -> Option<&'a mut Class> {
-    classes.iter_mut().find(|c| is_self_type(self_ty, Some(&c.ident)) && !is_self_keyword(self_ty))
+    classes.iter_mut().find(|c| is_class(self_ty, &c.ident))
 }
 
+/// Does the impl block have `pub` functions or constants (which are exported
+/// for a class)?
 fn has_pub_items(imp: &ItemImpl) -> bool {
     imp.items.iter().any(|item| match item {
         ImplItem::Fn(f) => is_pub(&f.vis),
@@ -375,14 +357,7 @@ fn has_pub_items(imp: &ItemImpl) -> bool {
 
 /// `X` or `self::X` for a type `X` defined in this module.
 fn is_local_type(ty: &Type, local: &HashSet<String>) -> bool {
-    let Type::Path(tp) = ty else { return false };
-    let segments = &tp.path.segments;
-    let last = match segments.len() {
-        1 if tp.qself.is_none() && tp.path.leading_colon.is_none() => &segments[0],
-        2 if segments[0].ident == "self" => &segments[1],
-        _ => return false,
-    };
-    local.contains(&last.ident.to_string())
+    local_path(ty).is_some_and(|last| local.contains(&last.ident.to_string()))
 }
 
 /// Names starting with `__orochi` are reserved for the generated code.
@@ -414,10 +389,6 @@ fn check_reserved(cx: &mut Cx, item: &Item) {
     }
 }
 
-fn is_self_keyword(ty: &Type) -> bool {
-    matches!(ty, Type::Path(tp) if tp.path.is_ident("Self"))
-}
-
 // ---------------------------------------------------------------- classes
 
 fn derives(attrs: &[Attribute]) -> HashSet<String> {
@@ -442,7 +413,8 @@ fn reject_generics(cx: &mut Cx, generics: &syn::Generics, what: &str) {
     }
 }
 
-/// Adds the bare `#[pyclass]` and collects the field properties.
+/// Adds `#[pyclass]` (with orochi's pyo3 and the module's name) and
+/// collects the field properties.
 fn process_struct(cx: &mut Cx, mut s: ItemStruct, module: &str) -> (ItemStruct, Class) {
     reject_generics(cx, &s.generics, "a struct");
     check_python_name(cx, &s.ident.unraw().to_string(), &s.ident, "class");
@@ -455,7 +427,6 @@ fn process_struct(cx: &mut Cx, mut s: ItemStruct, module: &str) -> (ItemStruct, 
         eq: d.contains("PartialEq"),
         hash: d.contains("Hash"),
         has_ctor: false,
-        ctor_doc: Vec::new(),
         names: Names::default(),
         calls: Vec::new(),
         extra: Vec::new(),
@@ -503,7 +474,7 @@ fn trait_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
         PathArguments::None => true,
         PathArguments::AngleBracketed(args) => {
             args.args.len() == 1
-                && matches!(&args.args[0], GenericArgument::Type(t) if is_self_type(t, Some(&class.ident)))
+                && matches!(&args.args[0], GenericArgument::Type(t) if is_self_keyword(t) || is_class(t, &class.ident))
         }
         PathArguments::Parenthesized(_) => false,
     };
@@ -532,12 +503,7 @@ fn trait_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
 
 /// Constructor, methods, static methods and constants of a class.
 fn inherent_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
-    let exported = imp.items.iter().any(|item| match item {
-        ImplItem::Fn(f) => is_pub(&f.vis),
-        ImplItem::Const(c) => is_pub(&c.vis),
-        _ => false,
-    });
-    if exported {
+    if has_pub_items(imp) {
         reject_generics(cx, &imp.generics, "an impl block with `pub` items");
     }
     let impl_cfg = cfg_attrs(&imp.attrs);
@@ -559,20 +525,17 @@ fn inherent_impl(cx: &mut Cx, imp: &ItemImpl, class: &mut Class) {
                 };
                 if let Some((checks, call)) = function_call(cx, &f.sig, &f.attrs, kind, Some(&ident)) {
                     let cfg = impl_cfg.iter().chain(&cfg_attrs(&f.attrs)).cloned().collect::<Vec<_>>();
+                    class.calls.push(quote!(#(#cfg)* { #checks #call }));
                     if kind == Kind::Constructor {
-                        class.calls.push(quote!(#(#cfg)* { #checks }));
-                        let class_cfg = &class.cfg;
-                        class.extra.push(quote!(#(#class_cfg)* #(#cfg)* #call));
-                        class.ctor_doc = f.attrs.iter().filter(|a| a.path().is_ident("doc")).cloned().collect();
-                    } else {
-                        class.calls.push(quote!(#(#cfg)* { #checks #call }));
+                        let (class_cfg, new) = (&class.cfg, new_method(&ident));
+                        class.extra.push(quote!(#(#class_cfg)* #(#cfg)* #new));
                     }
                 }
             }
             ImplItem::Const(c) if is_pub(&c.vis) => {
                 let mut attrs = impl_cfg.clone();
                 attrs.extend(c.attrs.iter().cloned());
-                class.calls.extend(constant(cx, &mut class.names, &c.ident, &attrs, &c.ty, quote!(__orochi_c), quote!(#ident)));
+                class.calls.push(constant(cx, &mut class.names, &c.ident, &attrs, &c.ty, quote!(__orochi_c), quote!(#ident)));
             }
             _ => {}
         }
@@ -619,12 +582,12 @@ enum Kind {
     Constructor,
 }
 
-/// The most parameters `orochi::Handler` supports.
+/// The most parameters `orochi::Handler` supports: `MAX_ARITY` in orochi's
+/// `src/handler.rs` (this crate cannot depend on orochi).
 const MAX_PARAMS: usize = 12;
 
 /// Validates an exported function or method and returns compile-time checks
-/// of its parameter and return types, and its builder call (for a
-/// constructor: the `#[pymethods]` block with its `#[new]`).
+/// of its parameter and return types, and its builder call.
 fn function_call(
     cx: &mut Cx,
     sig: &Signature,
@@ -736,28 +699,7 @@ fn function_call(
             quote_spanned!(span=> __orochi_m.function(#name, &[#(#params),*], #doc, self::#ident)?;)
         }
         (Kind::Constructor, Some(c)) => {
-            // `#[new]` keeps pyo3's own `tp_new`, so no instance exists
-            // without running `new`.
-            let construct = quote_spanned!(span=> ::orochi::construct::<Self, _, _>(&[#(#params),*], #c::#ident, args, kwargs));
-            let text_signature = text_signature(sig, &params);
-            return Some((
-                quote!(#(#checks)*),
-                quote! {
-                    #[::orochi::pyo3::pymethods(crate = "::orochi::pyo3")]
-                    impl #c {
-                        #[new]
-                        #[pyo3(signature = (*args, **kwargs), text_signature = #text_signature)]
-                        fn __orochi_new(
-                            args: &::orochi::pyo3::Bound<'_, ::orochi::pyo3::types::PyTuple>,
-                            kwargs: ::core::option::Option<
-                                &::orochi::pyo3::Bound<'_, ::orochi::pyo3::types::PyDict>,
-                            >,
-                        ) -> ::orochi::pyo3::PyResult<Self> {
-                            #construct
-                        }
-                    }
-                },
-            ));
+            quote_spanned!(span=> __orochi_c.constructor(&[#(#params),*], #doc, #c::#ident)?;)
         }
         (Kind::Method, Some(c)) => {
             quote_spanned!(span=> __orochi_c.method(#name, &[#(#params),*], #doc, #c::#ident)?;)
@@ -770,26 +712,24 @@ fn function_call(
     Some((quote!(#(#checks)*), call))
 }
 
-/// The constructor's `__text_signature__`: a trailing run of parameters
-/// whose type is spelled `Option<..>` defaults to `None` (what the binder
-/// does for every `Option`; an alias of `Option` shows without default).
-fn text_signature(sig: &Signature, params: &[String]) -> String {
-    let optional: Vec<bool> = sig
-        .inputs
-        .iter()
-        .filter_map(|input| match input {
-            FnArg::Typed(pt) => Some(matches!(&*pt.ty, Type::Path(tp)
-                if tp.qself.is_none() && tp.path.segments.last().is_some_and(|s| s.ident == "Option"))),
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-    let required = optional.iter().rposition(|o| !o).map_or(0, |i| i + 1);
-    let parts: Vec<String> = params
-        .iter()
-        .enumerate()
-        .map(|(i, p)| if i < required { p.clone() } else { format!("{p}=None") })
-        .collect();
-    format!("({})", parts.join(", "))
+/// The `#[new]` of a class with a constructor: it runs the constructor
+/// registered with `ClassBuilder::constructor`. `#[new]` keeps pyo3's own
+/// `tp_new`, so no instance exists without running `new`. The signature is
+/// set at registration (`__signature__`), so pyo3 adds none.
+fn new_method(class: &Ident) -> TokenStream2 {
+    quote! {
+        #[::orochi::pyo3::pymethods(crate = "::orochi::pyo3")]
+        impl #class {
+            #[new]
+            #[pyo3(signature = (*args, **kwargs), text_signature = None)]
+            fn __orochi_new(
+                args: &::orochi::pyo3::Bound<'_, ::orochi::pyo3::types::PyTuple>,
+                kwargs: ::core::option::Option<&::orochi::pyo3::Bound<'_, ::orochi::pyo3::types::PyDict>>,
+            ) -> ::orochi::pyo3::PyResult<Self> {
+                ::orochi::construct(args, kwargs)
+            }
+        }
+    }
 }
 
 /// `Self` in a method's types, spelled as the class (the checks are
@@ -876,20 +816,28 @@ fn check_borrowed_return(cx: &mut Cx, ty: &Type) {
     }
 }
 
-/// `Self`, or the class's own name (`Point` / `self::Point`).
-fn is_self_type(ty: &Type, class: Option<&Ident>) -> bool {
-    let Type::Path(tp) = ty else { return false };
+/// The last segment of a path to an item of this module: `X` or `self::X`.
+fn local_path(ty: &Type) -> Option<&PathSegment> {
+    let Type::Path(tp) = ty else { return None };
     if tp.qself.is_some() || tp.path.leading_colon.is_some() {
-        return false;
+        return None;
     }
     let segments = &tp.path.segments;
-    let last = match segments.len() {
-        1 => &segments[0],
-        2 if segments[0].ident == "self" => &segments[1],
-        _ => return false,
-    };
-    matches!(last.arguments, PathArguments::None)
-        && (last.ident == "Self" || class.is_some_and(|c| last.ident == *c))
+    match segments.len() {
+        1 => Some(&segments[0]),
+        2 if segments[0].ident == "self" => Some(&segments[1]),
+        _ => None,
+    }
+}
+
+/// The class's own name: `Point` or `self::Point`.
+fn is_class(ty: &Type, class: &Ident) -> bool {
+    local_path(ty).is_some_and(|last| last.ident == *class && last.arguments.is_none())
+}
+
+/// `Self`.
+fn is_self_keyword(ty: &Type) -> bool {
+    matches!(ty, Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self"))
 }
 
 // ---------------------------------------------------------------- attributes
@@ -1032,10 +980,10 @@ mod tests {
         for expected in [
             "pyclass (crate = \"::orochi::pyo3\" , module = \"m\")",
             "__orochi_m . function (\"add\" , & [\"a\" , \"b\"]",
-            "# [new] # [pyo3 (signature = (* args , * * kwargs) , text_signature = \"(x, y=None)\")]",
+            "# [new] # [pyo3 (signature = (* args , * * kwargs) , text_signature = None)]",
             "fn __orochi_new",
-            ":: orochi :: construct :: < Self , _ , _ > (& [\"x\" , \"y\"] , P :: new , args , kwargs)",
-            "# [doc = \"\"] # [doc = r\" Makes a P.\"]",
+            ":: orochi :: construct (args , kwargs)",
+            "__orochi_c . constructor (& [\"x\" , \"y\"] , :: core :: concat ! (\"Makes a P.\") , P :: new)",
             "__orochi_c . method (\"get\" , & [\"other\"]",
             "assert_arg :: < & P , _ >",
             "__orochi_c . static_method (\"origin\"",
@@ -1047,5 +995,7 @@ mod tests {
         ] {
             assert!(out.contains(expected), "missing {expected:?} in\n{out}");
         }
+        // The constructor's doc goes to the builder, not to the struct's rustdoc.
+        assert!(out.matches("Makes a P.").count() == 2, "constructor doc on the struct in\n{out}");
     }
 }

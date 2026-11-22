@@ -1,19 +1,22 @@
 //! The runtime builder that `#[orochi::module]` calls: [`ModuleBuilder`],
 //! [`ClassBuilder`] and [`construct`].
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
+use std::collections::BTreeMap;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hash};
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyModule, PyTuple, PyType};
 
 use crate::class::{Class, Ref};
 use crate::convert::{FromObject, IntoObject};
 use crate::error::Result;
-use crate::function::{Binder, Signature, new_function, non_empty, required};
+use crate::function::{Signature, new_function, non_empty};
 use crate::handler::{Handler, IntoInstance, Ret, convert_named, instance};
 use crate::handles::{Dict, List, Set};
 use crate::object::Object;
@@ -40,13 +43,13 @@ use crate::runtime::attach;
 ///     count: i64,
 /// }
 ///
-/// // The constructor: one `#[new]` that hands its arguments to `construct`.
+/// // One `#[new]` that runs the constructor registered with the builder.
 /// #[pymethods(crate = "orochi::pyo3")]
 /// impl Counter {
 ///     #[new]
-///     #[pyo3(signature = (*args, **kwargs), text_signature = "(start=None)")]
+///     #[pyo3(signature = (*args, **kwargs), text_signature = None)]
 ///     fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-///         orochi::construct(&["start"], |start: Option<i64>| Counter { count: start.unwrap_or(0) }, args, kwargs)
+///         orochi::construct(args, kwargs)
 ///     }
 /// }
 ///
@@ -62,6 +65,9 @@ use crate::runtime::attach;
 ///         })?;
 ///     // Each `ClassBuilder` call returns the builder again.
 ///     m.class::<Counter>()?
+///         .constructor(&["start"], "Starts at `start`, or 0.", |start: Option<i64>| Counter {
+///             count: start.unwrap_or(0),
+///         })?
 ///         .method("incr", &[], "Count one more.", |c: &mut Counter| c.count += 1)?
 ///         .field("count", "", |c: &Counter| &c.count, |c: &mut Counter| &mut c.count)?
 ///         .repr_debug()?
@@ -86,6 +92,7 @@ use crate::runtime::attach;
 ///     assert c.count == 2 and c == handmade.Counter(2)
 ///     assert repr(c) == "Counter { count: 2 }"
 ///     assert str(inspect.signature(handmade.Counter)) == "(start=None)"
+///     assert handmade.Counter.__doc__ == "A counter.\n\nStarts at `start`, or 0."
 /// "#)?;
 /// # Ok::<(), orochi::Error>(())
 /// ```
@@ -112,7 +119,15 @@ pub fn init_module(
 /// library, e.g. in tests that embed Python: `#[orochi::module] mod mylib`
 /// generates `mylib::__orochi_module()`, which calls this.
 pub fn load_module(name: &str, init: impl FnOnce(&ModuleBuilder<'_>) -> Result<()>) -> Result<Object> {
+    // `init` may release the GIL (an import does), so another thread could
+    // start building the same module meanwhile: a Python lock, which
+    // releases the GIL while it waits, lets only one thread build at a time.
+    static LOCK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     attach(|py| {
+        let lock = LOCK.get_or_try_init(py, || py.import("threading")?.getattr("RLock")?.call0().map(Bound::unbind))?;
+        lock.bind(py).call_method0("acquire")?;
+        // Released on every way out, including a panic in `init`.
+        let _release = Release(lock.bind(py));
         let modules = py.import("sys")?.getattr("modules")?;
         if let Ok(module) = modules.get_item(name) {
             return Ok(Object::from_bound(module));
@@ -124,44 +139,55 @@ pub fn load_module(name: &str, init: impl FnOnce(&ModuleBuilder<'_>) -> Result<(
     })
 }
 
-/// The body of a class's `#[new]` (see [`ModuleBuilder`] for a complete
-/// example): binds `args` / `kwargs` to the parameter names `params` and
-/// calls `new`, which returns `T` or `Result<T, E>`.
+/// Releases a held Python lock when dropped.
+struct Release<'a, 'py>(&'a Bound<'py, PyAny>);
+
+impl Drop for Release<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.0.call_method0("release");
+    }
+}
+
+/// The body of a class's `#[new]`: runs the constructor registered with
+/// [`ClassBuilder::constructor`] (see [`ModuleBuilder`] for a complete
+/// example).
 ///
 /// ```ignore
 /// #[pymethods(crate = "orochi::pyo3")]
 /// impl Point {
 ///     #[new]
-///     #[pyo3(signature = (*args, **kwargs), text_signature = "(x, y)")]
+///     #[pyo3(signature = (*args, **kwargs), text_signature = None)]
 ///     fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-///         orochi::construct(&["x", "y"], Point::new, args, kwargs)
+///         orochi::construct(args, kwargs)
 ///     }
 /// }
 /// ```
 ///
 /// The class's own `tp_new` stays pyo3's, so Python cannot create an
-/// instance without running `new` (`object.__new__(Point)` raises).
-pub fn construct<T, M, F>(
-    params: &[&str],
-    new: F,
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<T>
-where
-    T: Class,
-    F: Handler<M>,
-    F::Output: IntoInstance<T>,
-{
-    if params.len() != F::OPTIONAL.len() {
+/// instance without running the constructor (`object.__new__(Point)`
+/// raises). `text_signature = None` leaves the signature to
+/// [`ClassBuilder::constructor`], which sets `__signature__`.
+pub fn construct<T: Class>(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<T> {
+    let new = constructors().get(&TypeId::of::<T>()).cloned();
+    let Some(new) = new else {
         return Err(PyTypeError::new_err(format!(
-            "{}: {} parameter names given for a constructor with {} parameters",
-            T::NAME,
-            params.len(),
-            F::OPTIONAL.len()
+            "cannot create '{}' instances: no constructor was registered with `ClassBuilder::constructor`",
+            T::NAME
         )));
-    }
-    let binder = Binder { qualname: T::NAME, method: false, names: params, required: required(F::OPTIONAL, 0) };
-    new.call(&binder.bind(args, kwargs)?, params)?.into_instance()
+    };
+    let new = new.downcast_ref::<Box<Constructor<T>>>().expect("registered under the TypeId of T");
+    new(args, kwargs)
+}
+
+/// A constructor of class `T`, as [`construct`] calls it.
+type Constructor<T> = dyn Fn(&Bound<'_, PyTuple>, Option<&Bound<'_, PyDict>>) -> PyResult<T> + Send + Sync;
+
+/// The constructor of each class (a `Box<Constructor<T>>`) by the class's
+/// `TypeId`. A `#[new]` is a plain function that cannot hold a closure, so
+/// [`construct`] looks the closure up here.
+fn constructors() -> MutexGuard<'static, BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>> {
+    static CONSTRUCTORS: Mutex<BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>> = Mutex::new(BTreeMap::new());
+    CONSTRUCTORS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl<'py> ModuleBuilder<'py> {
@@ -201,8 +227,7 @@ impl<'py> ModuleBuilder<'py> {
         Ok(self)
     }
 
-    /// Adds class `T` under its Rust name and returns its builder. The
-    /// constructor is the class's `#[new]` (see [`construct`]).
+    /// Adds class `T` under its Rust name and returns its builder.
     pub fn class<T: Class>(&self) -> Result<ClassBuilder<'py, T>> {
         // Methods bind through `types.MethodType`; import it now.
         crate::function::method_type(self.py())?;
@@ -299,6 +324,33 @@ impl<'py, T: Class> ClassBuilder<'py, T> {
     /// (`#[pyclass]` already uses the struct's doc comment.)
     pub fn doc(&self, doc: &str) -> Result<Self> {
         if let Some(doc) = non_empty(doc) {
+            self.ty.setattr("__doc__", doc)?;
+        }
+        Ok(self.clone())
+    }
+
+    /// Sets the constructor, which the class's `#[new]` runs through
+    /// [`construct`]: `params` names the parameters of `new` (as for a
+    /// function), which returns `T` or `Result<T, E>`. Sets the class's
+    /// `__signature__` and, the first time, appends `doc` to its docstring
+    /// after a blank line.
+    pub fn constructor<M, F>(&self, params: &[&str], doc: &str, new: F) -> Result<Self>
+    where
+        F: Handler<M>,
+        F::Output: IntoInstance<T>,
+    {
+        let sig = Signature::new(self.qualname.clone(), false, params, F::OPTIONAL)?;
+        self.ty.setattr("__signature__", sig.to_inspect(self.py())?)?;
+        let new: Box<Constructor<T>> =
+            Box::new(move |args, kwargs| new.call(&sig.bind(args, kwargs)?, &sig.names)?.into_instance());
+        // A replaced constructor is dropped after the table is unlocked: its
+        // drop may run Python code.
+        let replaced = constructors().insert(TypeId::of::<T>(), Arc::new(new));
+        if let (None, Some(doc)) = (&replaced, non_empty(doc)) {
+            let doc = match self.ty.getattr("__doc__")?.extract::<Option<String>>()? {
+                Some(class_doc) if !class_doc.is_empty() => format!("{class_doc}\n\n{doc}"),
+                _ => doc.to_owned(),
+            };
             self.ty.setattr("__doc__", doc)?;
         }
         Ok(self.clone())

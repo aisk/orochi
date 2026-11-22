@@ -16,9 +16,9 @@ use crate::runtime::attach;
 ///
 /// Implemented automatically for every type with pyo3's `#[pyclass]`
 /// (`#[orochi::module]` adds it to each `pub struct`) that is not `frozen`
-/// and is `Send + Sync`. The class gets its methods and properties from
-/// [`ClassBuilder`](crate::ClassBuilder), and its constructor from a
-/// `#[new]` that calls [`construct`](crate::construct).
+/// and is `Send + Sync`. The class gets its constructor, methods and
+/// properties from [`ClassBuilder`](crate::ClassBuilder); Python runs the
+/// constructor through a `#[new]` that calls [`construct`](crate::construct).
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a Python class",
     label = "not a `pub struct` of an `#[orochi::module]` (or a `#[pyclass]` type)",

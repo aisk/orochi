@@ -349,7 +349,8 @@ impl<T: Class, E: Into<Error>> IntoInstance<T> for std::result::Result<T, E> {
     }
 }
 
-/// The most parameters a [`Handler`] can have (`self` included).
+/// The most parameters a [`Handler`] can have (`self` included). The macro
+/// crate checks the same limit (`MAX_PARAMS` in `orochi-macros`).
 pub(crate) const MAX_ARITY: usize = 12;
 
 /// The arguments of one call, bound to the function's parameters (`None`
@@ -377,7 +378,7 @@ pub trait Handler<M>: Send + Sync + 'static {
     fn receiver() -> Option<TypeId>;
     /// Calls the function with bound arguments, named `names` in errors.
     #[doc(hidden)]
-    fn call<S: AsRef<str>>(&self, args: &BoundArgs<'_>, names: &[S]) -> PyResult<Self::Output>;
+    fn call(&self, args: &BoundArgs<'_>, names: &[String]) -> PyResult<Self::Output>;
 }
 
 macro_rules! first {
@@ -409,7 +410,7 @@ macro_rules! handler {
             }
 
             #[allow(unused_variables)]
-            fn call<S: AsRef<str>>(&self, args: &BoundArgs<'_>, names: &[S]) -> PyResult<R> {
+            fn call(&self, args: &BoundArgs<'_>, names: &[String]) -> PyResult<R> {
                 // Selects the higher-ranked `Fn` bound for the call.
                 #[allow(clippy::too_many_arguments)]
                 fn call<R, $($A),*>(f: &impl Fn($($A),*) -> R, $($o: $A),*) -> R {
@@ -417,7 +418,7 @@ macro_rules! handler {
                 }
                 // Convert everything first, then borrow class instances; the
                 // borrows end before the result is converted.
-                $(let mut $h = <$A as Arg<$M>>::hold(args[$i].as_ref(), names[$i].as_ref())?;)*
+                $(let mut $h = <$A as Arg<$M>>::hold(args[$i].as_ref(), &names[$i])?;)*
                 $(let $o = <$A as Arg<$M>>::get(&mut $h)?;)*
                 Ok(call(self, $($o),*))
             }

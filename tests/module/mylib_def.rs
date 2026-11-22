@@ -245,6 +245,20 @@ pub mod mylib {
         }
     }
 
+    type Maybe<T> = Option<T>;
+
+    pub struct Span {
+        pub start: i64,
+        pub stop: i64,
+    }
+
+    impl Span {
+        /// Counts from `start` (0 if omitted) to `stop`.
+        pub fn new(stop: i64, start: Maybe<i64>) -> Self {
+            Span { start: start.unwrap_or(0), stop }
+        }
+    }
+
     /// Not `Clone`: can only be borrowed or shared.
     #[derive(Default)]
     pub struct Counter {

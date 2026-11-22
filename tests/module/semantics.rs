@@ -101,6 +101,9 @@ fn inspect_signature_and_help() {
         assert sig(mylib.Point.origin) == "()", sig(mylib.Point.origin)
         assert sig(mylib.Point) == "(x, y)", sig(mylib.Point)
         assert sig(mylib.Tag) == "(name)", sig(mylib.Tag)
+        # An alias of `Option` defaults to `None` in the signature as in the binder.
+        assert sig(mylib.Span) == "(stop, start=None)", sig(mylib.Span)
+        assert mylib.Span(3).start == 0 and mylib.Span(stop=3, start=1).start == 1
         p = inspect.signature(mylib.add).parameters
         assert p["b"].default is None and p["a"].default is inspect.Parameter.empty
 
@@ -108,6 +111,7 @@ fn inspect_signature_and_help() {
         assert "norm(self, /)" in text and "Euclidean norm." in text, text
         assert "dist(self, /, other)" in text, text
         assert "origin()" in text, text
+        assert "Point(x, y)" in text, text
         assert "Horizontal coordinate." in text, text
         text = pydoc.render_doc(mylib, renderer=pydoc.plaintext)
         assert "add(a, b=None)" in text and "Add two integers." in text, text
@@ -117,9 +121,12 @@ fn inspect_signature_and_help() {
 #[test]
 fn constructors_keep_pyo3_tp_new() {
     run(r#"
+        import pydoc
         P = mylib.Point
-        assert "Creates a point from its coordinates." in P.__doc__, P.__doc__
-        assert P.__doc__.startswith("A 2D point."), P.__doc__
+        assert P.__doc__ == "A 2D point.\n\nCreates a point from its coordinates.", P.__doc__
+        # Without a struct doc, the class doc is the constructor's.
+        assert mylib.Span.__doc__ == "Counts from `start` (0 if omitted) to `stop`.", mylib.Span.__doc__
+        assert "Creates a point" in pydoc.render_doc(P, renderer=pydoc.plaintext)
         for cls in (P, mylib.Token, mylib.Counter):
             try:
                 object.__new__(cls)

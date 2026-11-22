@@ -105,20 +105,16 @@ pub(crate) fn non_empty(doc: &str) -> Option<&str> {
     (!doc.is_empty()).then_some(doc)
 }
 
-/// The number of leading parameters without a default: only a trailing run
-/// of `Option` parameters gets one (`None`).
-pub(crate) fn required(optional: &[bool], first: usize) -> usize {
-    optional.iter().rposition(|o| !o).map_or(0, |i| i + 1).max(first)
-}
-
-/// The Python-visible signature of one function or method.
+/// The Python-visible signature of one function, method or constructor.
 pub(crate) struct Signature {
-    /// Used in error messages (`add()`, `Point.dist()`).
+    /// Used in error messages (`add()`, `Point.dist()`, `Point()`).
     pub(crate) qualname: String,
-    /// The first parameter is the instance (`self`).
+    /// The first parameter is the instance (`self`); counts and messages
+    /// include it, as CPython's do.
     method: bool,
     /// The Rust parameter names, `self` first for methods.
     pub(crate) names: Vec<String>,
+    /// The number of leading parameters without a default.
     required: usize,
     /// Keyword arguments are rejected (the names are made up).
     positional_only: bool,
@@ -151,7 +147,8 @@ impl Signature {
             }
             names.push((*param).to_owned());
         }
-        let required = required(optional, first);
+        // Only a trailing run of optional parameters gets a default (`None`).
+        let required = optional.iter().rposition(|o| !o).map_or(0, |i| i + 1).max(first);
         Ok(Signature { qualname, method, names, required, positional_only: false })
     }
 
@@ -164,21 +161,6 @@ impl Signature {
         Ok(Signature { positional_only: true, ..Signature::new(qualname, false, &params, optional)? })
     }
 
-    fn binder(&self) -> Binder<'_, String> {
-        Binder { qualname: &self.qualname, method: self.method, names: &self.names, required: self.required }
-    }
-
-    /// Binds one call's arguments to the parameters.
-    fn bind<'py>(
-        &self,
-        args: &Bound<'py, PyTuple>,
-        kwargs: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<BoundArgs<'py>> {
-        if self.positional_only && kwargs.is_some_and(|kw| !kw.is_empty()) {
-            return Err(PyTypeError::new_err(format!("{}() takes no keyword arguments", self.qualname)));
-        }
-        self.binder().bind(args, kwargs)
-    }
 
     /// `__text_signature__`: `(a, b=None)`, `($self, k)`, `(arg1, /)`.
     fn text(&self) -> String {
@@ -195,24 +177,34 @@ impl Signature {
         }
         format!("({})", parts.join(", "))
     }
-}
 
-/// Binds `(args, kwargs)` to parameter names, raising `TypeError` with
-/// CPython's wording when they do not fit.
-pub(crate) struct Binder<'s, S> {
-    pub(crate) qualname: &'s str,
-    /// Counts and messages include `self`, as CPython's do.
-    pub(crate) method: bool,
-    pub(crate) names: &'s [S],
-    pub(crate) required: usize,
-}
+    /// The same signature as an `inspect.Signature`, for a class's
+    /// `__signature__` (a class's `__text_signature__` cannot be set).
+    pub(crate) fn to_inspect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inspect = py.import("inspect")?;
+        let parameter = inspect.getattr("Parameter")?;
+        let kind = parameter.getattr("POSITIONAL_OR_KEYWORD")?;
+        let mut params = Vec::with_capacity(self.names.len());
+        for (i, name) in self.names.iter().enumerate().skip(usize::from(self.method)) {
+            let kwargs = PyDict::new(py);
+            if i >= self.required {
+                kwargs.set_item("default", py.None())?;
+            }
+            params.push(parameter.call((name, &kind), Some(&kwargs))?);
+        }
+        inspect.getattr("Signature")?.call1((params,))
+    }
 
-impl<S: AsRef<str>> Binder<'_, S> {
+    /// Binds one call's arguments to the parameters, raising `TypeError`
+    /// with CPython's wording when they do not fit.
     pub(crate) fn bind<'py>(
         &self,
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<BoundArgs<'py>> {
+        if self.positional_only && kwargs.is_some_and(|kw| !kw.is_empty()) {
+            return Err(PyTypeError::new_err(format!("{}() takes no keyword arguments", self.qualname)));
+        }
         let given = args.len();
         let first = usize::from(self.method);
         if given == 0 && self.method {
@@ -231,7 +223,7 @@ impl<S: AsRef<str>> Binder<'_, S> {
                     return Err(PyTypeError::new_err("keywords must be strings"));
                 };
                 let key = key.to_str()?;
-                let index = self.names[first..].iter().position(|p| p.as_ref() == key).map(|i| i + first);
+                let index = self.names[first..].iter().position(|p| p == key).map(|i| i + first);
                 match index {
                     Some(i) if out[i].is_some() => {
                         return Err(PyTypeError::new_err(format!(
@@ -250,7 +242,7 @@ impl<S: AsRef<str>> Binder<'_, S> {
             }
         }
         let missing: Vec<&str> =
-            (first..self.required).filter(|&i| out[i].is_none()).map(|i| self.names[i].as_ref()).collect();
+            (first..self.required).filter(|&i| out[i].is_none()).map(|i| self.names[i].as_str()).collect();
         if !missing.is_empty() {
             return Err(self.missing(&missing));
         }

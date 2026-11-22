@@ -162,15 +162,16 @@ without it), and plain calls to `orochi::ModuleBuilder` /
 #[pymethods]
 impl Point {
     #[new]
-    #[pyo3(signature = (*args, **kwargs), text_signature = "(x, y)")]
+    #[pyo3(signature = (*args, **kwargs), text_signature = None)]
     fn __orochi_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        orochi::construct(&["x", "y"], Point::new, args, kwargs)
+        orochi::construct(args, kwargs)
     }
 }
 
 pub fn __orochi_init(__orochi_m: &orochi::ModuleBuilder<'_>) -> orochi::Result<()> {
     __orochi_m.doc("My first extension module.")?;
     let __orochi_c = __orochi_m.class::<Point>()?;
+    __orochi_c.constructor(&["x", "y"], "", Point::new)?;
     __orochi_c.field("x", "", |s: &Point| &s.x, |s: &mut Point| &mut s.x)?;
     __orochi_c.method("norm", &[], "", Point::norm)?;
     __orochi_c.method("dist", &["other"], "", Point::dist)?;
