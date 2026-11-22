@@ -2,5 +2,19 @@
 name = "orochi"
 version = "0.1.0"
 edition = "2024"
+description = "An ease-of-use-first layer over pyo3 for writing Python extensions in Rust"
+
+[features]
+# Start the Python interpreter automatically on first use. Enable this when
+# orochi is used from a standalone Rust program (embedding Python); leave it
+# off when building an extension module.
+embed = ["pyo3/auto-initialize"]
 
 [dependencies]
+pyo3 = "0.30.1"
+
+[dev-dependencies]
+# Tests and doctests run against an embedded interpreter: depending on the
+# crate itself enables `embed` for test builds only (dev-dependency features
+# are not unified into normal builds of the crate or its dependents).
+orochi = { path = ".", features = ["embed"] }
