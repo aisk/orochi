@@ -6,6 +6,9 @@ extension modules in Rust, in the spirit of pybind11 / nanobind. No
 Python module, `pub` means exported, and plain Rust signatures say how values
 cross the boundary. A simple API is the goal; performance is not.
 
+This README is a quick tour. The full documentation is the
+**[reference](docs/reference.md)**.
+
 ```rust
 #[orochi::module]
 mod mylib {
@@ -82,10 +85,21 @@ three rules:
 3. **Your classes are borrowed.** `&self`, `&mut self`, `&Point` and
    `&mut Point` borrow the Python instance itself.
 
-**Everything else is in the [reference](docs/reference.md)**: all parameter
-and return types, classes and special methods, errors, the conversion table,
-calling Python from Rust, what the macro generates, writing a module by hand,
-and what is not supported yet.
+## Documentation
+
+The [reference](docs/reference.md) describes everything in detail:
+
+- [Exporting a module](docs/reference.md#exporting-a-module) and
+  [functions and parameters](docs/reference.md#functions-and-parameters)
+- [Classes](docs/reference.md#classes): constructors, methods, fields,
+  special methods
+- [Return values and errors](docs/reference.md#return-values-and-errors)
+- [Conversions](docs/reference.md#conversions): the full table of Rust and
+  Python types
+- [Calling Python from Rust](docs/reference.md#calling-python-from-rust)
+- [What the macro generates](docs/reference.md#what-the-macro-generates) and
+  [writing a module by hand](docs/reference.md#writing-a-module-by-hand)
+- [Not supported (yet)](docs/reference.md#not-supported-yet)
 
 ## Building an extension module
 
